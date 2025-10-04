@@ -1,0 +1,10 @@
+
+Example configuration
+data_source: bigquery
+bigquery:
+project_id: your-project-id
+dataset: ethereum
+api:
+etherscan_key: YOUR_API_KEY
+checkpoint:
+file: checkpoint.json
