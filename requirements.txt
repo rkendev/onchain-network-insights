@@ -1,3 +1,5 @@
 PyYAML
 requests
 pytest
+pydantic
+pyyaml

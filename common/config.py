@@ -1,11 +1,15 @@
-"""
-common.config
+# config.yaml
+data_source: rpc
 
-Load configuration from YAML / JSON.
-"""
-import yaml
-import os
+bigquery:
+  project_id: your-project-id
+  dataset: ethereum
 
-def load_config(path="config.yaml"):
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+rpc:
+  url: "https://mainnet.infura.io/v3/276f912c1d174836b7865519f2bb9fe6"  # override via $RPC_URL_OVERRIDE at runtime
+
+api:
+  etherscan_key: "REDACTED"
+
+checkpoint:
+  file: checkpoint.json

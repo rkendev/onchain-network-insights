@@ -1,10 +1,18 @@
+# config.yaml
 
-Example configuration
-data_source: bigquery
+## Which data source / ingestion mode to use.
+## Options: "bigquery", "rpc", "api", etc.
+data_source: rpc
+
 bigquery:
-project_id: your-project-id
-dataset: ethereum
+  project_id: your-project-id
+  dataset: ethereum
+
+rpc:
+  url: "https://mainnet.infura.io/v3/276f912c1d174836b7865519f2bb9fe6"
+
 api:
-etherscan_key: YOUR_API_KEY
+  etherscan_key: 276f912c1d174836b7865519f2bb9fe6
+
 checkpoint:
-file: checkpoint.json
+  file: checkpoint.json
