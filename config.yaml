@@ -1,7 +1,4 @@
 # config.yaml
-
-## Which data source / ingestion mode to use.
-## Options: "bigquery", "rpc", "api", etc.
 data_source: rpc
 
 bigquery:

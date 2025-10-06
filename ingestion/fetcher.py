@@ -1,5 +1,7 @@
 import requests
-from common.settings import load_settings
+from typing import Optional, Callable
+from common.settings import load_settings, Settings
+from ingestion.checkpoint import Checkpoint
 
 settings = load_settings()
 
@@ -110,3 +112,26 @@ def fetch_logs(address: str, from_block: int, to_block: int) -> list[dict]:
     if "error" in j:
         raise RuntimeError(f"RPC returned error: {j['error']}")
     return j.get("result", [])
+
+
+def ingest_incremental(
+    batch_size: int = 1000,
+    checkpoint_path: Optional[str] = None,
+    settings: Optional[Settings] = None,
+    fetch_block_fn: Optional[Callable[[int], dict]] = None,
+) -> int:
+    st = settings or load_settings()
+    cp_file = checkpoint_path or st.checkpoint.file
+    cp = Checkpoint(cp_file)
+
+    fetch = fetch_block_fn or fetch_block
+
+    last = cp.get_last()
+    start = (last + 1) if last is not None else 0
+    end = start + batch_size - 1
+
+    for blk in range(start, end + 1):
+        _ = fetch(blk)  # TODO: parse/store
+
+    cp.update(end)
+    return end
