@@ -1,32 +1,28 @@
+# common/settings.py
 import os
-from typing import Literal, Optional, Any
+from typing import Literal, Optional
 from pydantic import BaseModel, Field, model_validator, ValidationError
-
 
 class RPCConfig(BaseModel):
     url: str
     timeout: int = Field(default=10, ge=1)
     max_retries: int = Field(default=3, ge=0)
 
-
 class BigQueryConfig(BaseModel):
     project_id: str
     dataset: str
 
-
 class APIConfig(BaseModel):
     etherscan_key: Optional[str]
-
 
 class CheckpointConfig(BaseModel):
     file: str
 
-
 class Settings(BaseModel):
     data_source: Literal["bigquery", "rpc", "api"]
-    bigquery: Optional[BigQueryConfig]
-    rpc: Optional[RPCConfig]
-    api: Optional[APIConfig]
+    bigquery: Optional[BigQueryConfig] = None
+    rpc: Optional[RPCConfig] = None
+    api: Optional[APIConfig] = None
     checkpoint: CheckpointConfig
 
     @model_validator(mode="after")
@@ -38,7 +34,6 @@ class Settings(BaseModel):
             raise ValueError("BigQuery mode but missing bigquery configuration")
         if ds == "api" and self.api is None:
             raise ValueError("API mode but missing api configuration")
-        # Enforce HTTPS for RPC
         if ds == "rpc":
             url = self.rpc.url
             if not url.lower().startswith("https://"):
@@ -47,19 +42,16 @@ class Settings(BaseModel):
 
 def load_settings(path: str = "config.yaml") -> Settings:
     import yaml
-
     with open(path, "r") as f:
         cfg = yaml.safe_load(f) or {}
 
-    # Override sensitive parts from environment
+    # Allow secure override via env (do not commit real keys)
     if "rpc" in cfg:
         env_rpc = os.environ.get("RPC_URL_OVERRIDE")
         if env_rpc:
             cfg["rpc"]["url"] = env_rpc
 
     try:
-        settings = Settings.model_validate(cfg)
+        return Settings.model_validate(cfg)
     except ValidationError as e:
         raise RuntimeError(f"Configuration error in {path}: {e}") from e
-
-    return settings

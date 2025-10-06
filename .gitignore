@@ -68,3 +68,4 @@ local_settings.py
 # Misc
 .DS_Store
 Thumbs.db
+common/*.yaml
