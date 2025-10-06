@@ -2,6 +2,8 @@ import requests
 from typing import Optional, Callable
 from common.settings import load_settings, Settings
 from ingestion.checkpoint import Checkpoint
+from storage.manager import StorageManager
+from storage.sqlite_backend import SQLiteStorage
 
 settings = load_settings()
 
@@ -135,3 +137,16 @@ def ingest_incremental(
 
     cp.update(end)
     return end
+    
+
+def ingestion_pipeline(use_postgres: bool = False):
+    if use_postgres:
+        mgr: StorageManager = PostgresStorage(dsn="...")
+    else:
+        mgr = SQLiteStorage(path="data/storage.db")
+
+    mgr.setup()
+    # After fetch & parse steps:
+    mgr.write_block(parsed_block)
+    mgr.write_transaction(parsed_txn)
+    mgr.write_log(parsed_log)
