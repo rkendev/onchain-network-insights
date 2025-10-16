@@ -69,3 +69,6 @@ local_settings.py
 .DS_Store
 Thumbs.db
 common/*.yaml
+checkpoint.json
+*.zip
+data/
