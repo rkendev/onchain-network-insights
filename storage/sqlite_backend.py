@@ -1,7 +1,9 @@
+import os
 import sqlite3
 from typing import Dict, Any, Optional, List
 from .manager import StorageManager
 from .schema import CREATE_TABLE_BLOCKS, CREATE_TABLE_TXS, CREATE_TABLE_LOGS
+
 
 class SQLiteStorage(StorageManager):
     def __init__(self, path: str):
@@ -9,6 +11,11 @@ class SQLiteStorage(StorageManager):
         self.conn = None
 
     def setup(self) -> None:
+        # Ensure parent directory exists
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         c = self.conn.cursor()
         c.execute(CREATE_TABLE_BLOCKS)
