@@ -13,7 +13,7 @@ def _pick(raw: dict, key: str):
         return res.get(key)
     return None
 
-def run_etl(block_number: int, backend: str = "sqlite") -> int:
+def run_etl(block_number: int, backend: str = "sqlite", **backend_opts) -> int:
     raw = extract.extract_block(block_number)
 
     raw_txs = _pick(raw, "transactions") or []
@@ -26,7 +26,8 @@ def run_etl(block_number: int, backend: str = "sqlite") -> int:
     txs = transform.transform_transactions(raw_txs)
     logs = transform.transform_logs(raw_logs)
 
-    load.load_transactions(backend, txs)
-    load.load_logs(backend, logs)
+    # Pass through sqlite_path / pg_dsn etc.
+    load.load_transactions(backend, txs, **backend_opts)
+    load.load_logs(backend, logs, **backend_opts)
 
     return len(txs) + len(logs)
