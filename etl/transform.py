@@ -1,3 +1,6 @@
+from etl.erc20 import is_erc20_transfer, decode_erc20_transfer
+
+
 def _coerce_int(value, default=0) -> int:
     if value is None:
         return default
@@ -45,3 +48,13 @@ def transform_logs(raw_logs: list[dict]) -> list[dict]:
             "topics": lg.get("topics") or [],
         })
     return out
+
+
+def decode_erc20_transfers(raw_logs: list[dict]) -> list[dict]:
+    transfers = []
+    for lg in raw_logs or []:
+        if is_erc20_transfer(lg):
+            rec = decode_erc20_transfer(lg)
+            if rec:
+                transfers.append(rec)
+    return transfers

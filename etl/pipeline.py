@@ -3,7 +3,11 @@ import etl.extract as extract
 import etl.transform as transform
 import etl.load as load
 
+
 def _pick(raw: dict, key: str):
+    """
+    Safely get 'key' from either a flat dict or a nested {"result": {...}} response.
+    """
     if not isinstance(raw, dict):
         return None
     if key in raw:
@@ -13,7 +17,15 @@ def _pick(raw: dict, key: str):
         return res.get(key)
     return None
 
+
 def run_etl(block_number: int, backend: str = "sqlite", **backend_opts) -> int:
+    """
+    End-to-end ETL for a single block:
+      - extract raw block
+      - transform transactions, logs, and ERC-20 transfers
+      - load transactions & logs (transfers storage will be added in a follow-up)
+      - return count of processed records
+    """
     raw = extract.extract_block(block_number)
 
     raw_txs = _pick(raw, "transactions") or []
@@ -23,11 +35,14 @@ def run_etl(block_number: int, backend: str = "sqlite", **backend_opts) -> int:
     if not isinstance(raw_logs, list):
         raw_logs = []
 
+    # Transform
     txs = transform.transform_transactions(raw_txs)
     logs = transform.transform_logs(raw_logs)
+    transfers = transform.decode_erc20_transfers(raw_logs)
 
-    # Pass through sqlite_path / pg_dsn etc.
+    # Load (transfers storage will be added in a later branch)
     load.load_transactions(backend, txs, **backend_opts)
     load.load_logs(backend, logs, **backend_opts)
 
-    return len(txs) + len(logs)
+    # Count everything we processed (txs + logs + decoded transfers)
+    return len(txs) + len(logs) + len(transfers)
