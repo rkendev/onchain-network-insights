@@ -23,3 +23,15 @@ def load_logs(backend: str, logs: list[dict], *, sqlite_path: str | None = None,
     sm.setup()
     for lg in logs:
         sm.write_log(lg)
+
+def load_transfers(backend: str, transfers: list[dict], *, sqlite_path: str | None = None, pg_dsn: str | None = None):
+    sm = _get_storage(backend, sqlite_path=sqlite_path, pg_dsn=pg_dsn)
+    sm.setup()
+    for tr in transfers:
+        # normalize keys to what backends expect
+        if "sender" not in tr and "from" in tr:
+            tr["sender"] = tr["from"]
+        if "recipient" not in tr and "to" in tr:
+            tr["recipient"] = tr["to"]
+        sm.write_transfer(tr)
+

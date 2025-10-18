@@ -24,3 +24,15 @@ CREATE TABLE IF NOT EXISTS logs (
     PRIMARY KEY (tx_hash, address)
 );
 """
+
+CREATE_TABLE_TRANSFERS = """
+CREATE TABLE IF NOT EXISTS transfers (
+    tx_hash TEXT,
+    contract TEXT,
+    sender TEXT,
+    recipient TEXT,
+    value INTEGER,
+    block_number BIGINT,
+    PRIMARY KEY (tx_hash, contract, sender, recipient, block_number)
+);
+"""
