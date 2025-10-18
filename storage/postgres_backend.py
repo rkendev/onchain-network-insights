@@ -2,6 +2,9 @@ import psycopg2
 from typing import Dict, Any, Optional, List
 from .manager import StorageManager
 from .schema import CREATE_TABLE_BLOCKS, CREATE_TABLE_TXS, CREATE_TABLE_LOGS
+from .schema import (
+    CREATE_TABLE_BLOCKS, CREATE_TABLE_TXS, CREATE_TABLE_LOGS, CREATE_TABLE_TRANSFERS
+)
 
 class PostgresStorage(StorageManager):
     def __init__(self, dsn: str):
@@ -14,6 +17,7 @@ class PostgresStorage(StorageManager):
         cur.execute(CREATE_TABLE_BLOCKS)
         cur.execute(CREATE_TABLE_TXS)
         cur.execute(CREATE_TABLE_LOGS)
+        cur.execute(CREATE_TABLE_TRANSFERS)
         self.conn.commit()
 
     def write_block(self, block: Dict[str, Any]) -> None:
@@ -69,3 +73,35 @@ class PostgresStorage(StorageManager):
         cur.execute(sql, (start, end))
         rows = cur.fetchall()
         return [{"block_number": r[0], "block_hash": r[1], "timestamp": r[2]} for r in rows]
+
+
+    def write_transfer(self, tr: dict) -> None:
+        sql = """
+        INSERT INTO transfers
+        (tx_hash, contract, sender, recipient, value, block_number)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (tx_hash, contract, sender, recipient, block_number) DO NOTHING
+        """
+        data = (
+            tr["tx_hash"],
+            tr.get("contract"),
+            tr.get("from") or tr.get("sender"),
+            tr.get("to") or tr.get("recipient"),
+            int(tr.get("value", 0)),
+            tr.get("blockNumber") or tr.get("block_number"),
+        )
+        cur = self.conn.cursor()
+        cur.execute(sql, data)
+        self.conn.commit()
+
+
+    def load_transfers(backend: str, transfers: list[dict], *, sqlite_path: str | None = None, pg_dsn: str | None = None):
+        sm = _get_storage(backend, sqlite_path=sqlite_path, pg_dsn=pg_dsn)
+        sm.setup()
+        for tr in transfers:
+            # normalize keys to what backends expect
+            if "sender" not in tr and "from" in tr:
+                tr["sender"] = tr["from"]
+            if "recipient" not in tr and "to" in tr:
+                tr["recipient"] = tr["to"]
+            sm.write_transfer(tr)

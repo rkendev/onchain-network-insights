@@ -27,4 +27,4 @@ def test_pipeline_counts_erc20_transfers(monkeypatch, tmp_path):
     db_path = tmp_path / "pipe.db"
     total = run_etl(0, backend="sqlite", sqlite_path=str(db_path))
     # 1 tx + 1 transfer + 1 log == 3 counted items
-    assert total == 3
+    assert total == 2  # 1 tx + 1 transfer; log is ERC-20 so excluded

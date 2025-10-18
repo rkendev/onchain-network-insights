@@ -2,6 +2,7 @@
 import etl.extract as extract
 import etl.transform as transform
 import etl.load as load
+from etl.erc20 import is_erc20_transfer  # NEW
 
 
 def _pick(raw: dict, key: str):
@@ -23,8 +24,8 @@ def run_etl(block_number: int, backend: str = "sqlite", **backend_opts) -> int:
     End-to-end ETL for a single block:
       - extract raw block
       - transform transactions, logs, and ERC-20 transfers
-      - load transactions & logs (transfers storage will be added in a follow-up)
-      - return count of processed records
+      - load transactions, non-ERC20 logs, and transfers
+      - return count of DISTINCT stored records
     """
     raw = extract.extract_block(block_number)
 
@@ -35,14 +36,20 @@ def run_etl(block_number: int, backend: str = "sqlite", **backend_opts) -> int:
     if not isinstance(raw_logs, list):
         raw_logs = []
 
-    # Transform
-    txs = transform.transform_transactions(raw_txs)
-    logs = transform.transform_logs(raw_logs)
+    # Decode ERC-20 transfers first
     transfers = transform.decode_erc20_transfers(raw_logs)
 
-    # Load (transfers storage will be added in a later branch)
+    # Exclude ERC-20 transfer logs from the generic logs path to avoid double-counting
+    non_transfer_logs = [lg for lg in raw_logs if not is_erc20_transfer(lg)]
+
+    # Transform remaining entities
+    txs = transform.transform_transactions(raw_txs)
+    logs = transform.transform_logs(non_transfer_logs)
+
+    # Load into storage
     load.load_transactions(backend, txs, **backend_opts)
     load.load_logs(backend, logs, **backend_opts)
+    load.load_transfers(backend, transfers, **backend_opts)
 
-    # Count everything we processed (txs + logs + decoded transfers)
+    # Return distinct records persisted: txs + non-transfer logs + transfers
     return len(txs) + len(logs) + len(transfers)
