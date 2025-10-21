@@ -1,35 +1,30 @@
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+# storage/manager.py
+from __future__ import annotations
+from typing import Any, Dict
 
-class StorageManager(ABC):
-    """Abstract interface for storage backends."""
+from storage.sqlite_backend import SQLiteStorage
 
-    @abstractmethod
-    def setup(self) -> None:
-        """Initialize schema / tables if necessary."""
-        pass
+try:
+    # optional; may not be present in CI
+    from storage.postgres_backend import PostgresStorage  # type: ignore
+except Exception:  # pragma: no cover
+    PostgresStorage = None  # type: ignore
 
-    @abstractmethod
-    def write_block(self, block: Dict[str, Any]) -> None:
-        """Persist a block’s normalized data."""
-        pass
 
-    @abstractmethod
-    def read_block(self, block_number: int) -> Optional[Dict[str, Any]]:
-        """Read stored block by number, if exists."""
-        pass
-
-    @abstractmethod
-    def write_transaction(self, tx: Dict[str, Any]) -> None:
-        """Persist normalized transaction."""
-        pass
-
-    @abstractmethod
-    def write_log(self, log: Dict[str, Any]) -> None:
-        """Persist normalized log / event."""
-        pass
-
-    @abstractmethod
-    def query_blocks(self, start: int, end: int) -> List[Dict[str, Any]]:
-        """Return blocks in a range."""
-        pass
+def get_storage(backend: str, **opts: Dict[str, Any]):
+    """
+    Factory for storage backends. Accepts flexible option names.
+      - sqlite: db_path | sqlite_path | path
+      - postgres: dsn or individual kwargs
+    """
+    b = (backend or "").lower()
+    if b == "sqlite":
+        db_path = opts.get("db_path") or opts.get("sqlite_path") or opts.get("path") or "data/dev.db"
+        return SQLiteStorage(db_path)
+    elif b in ("postgres", "postgresql", "pg"):
+        if PostgresStorage is None:
+            raise RuntimeError("Postgres backend requested but psycopg2 not available")
+        dsn = opts.get("dsn")
+        return PostgresStorage(dsn=dsn, **{k: v for k, v in opts.items() if k != "dsn"})
+    else:
+        raise ValueError(f"Unknown storage backend: {backend!r}")

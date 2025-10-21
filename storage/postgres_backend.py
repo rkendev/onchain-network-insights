@@ -1,24 +1,46 @@
+# storage/postgres_backend.py
+import os
+from typing import Optional, Dict, Any
 import psycopg2
-from typing import Dict, Any, Optional, List
-from .manager import StorageManager
-from .schema import CREATE_TABLE_BLOCKS, CREATE_TABLE_TXS, CREATE_TABLE_LOGS
-from .schema import (
-    CREATE_TABLE_BLOCKS, CREATE_TABLE_TXS, CREATE_TABLE_LOGS, CREATE_TABLE_TRANSFERS
-)
 
-class PostgresStorage(StorageManager):
-    def __init__(self, dsn: str):
-        self.dsn = dsn
+class PostgresStorage:
+    def __init__(self, dsn: Optional[str] = None, **kwargs):
+        self.dsn = dsn or os.environ.get("PG_DSN") or ""
+        self.kwargs = kwargs
         self.conn = None
 
-    def setup(self) -> None:
-        self.conn = psycopg2.connect(self.dsn)
+    def setup(self):
+        if self.conn is None:
+            self.conn = psycopg2.connect(self.dsn, **self.kwargs)
         cur = self.conn.cursor()
-        cur.execute(CREATE_TABLE_BLOCKS)
-        cur.execute(CREATE_TABLE_TXS)
-        cur.execute(CREATE_TABLE_LOGS)
-        cur.execute(CREATE_TABLE_TRANSFERS)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS transfers (
+            tx_hash TEXT,
+            contract TEXT,
+            sender TEXT,
+            recipient TEXT,
+            value BIGINT,
+            block_number BIGINT
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            tx_hash TEXT,
+            address TEXT,
+            topics TEXT,
+            data TEXT,
+            block_number BIGINT
+        )""")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            tx_hash TEXT PRIMARY KEY,
+            frm TEXT,
+            too TEXT,
+            value BIGINT,
+            input TEXT,
+            block_number BIGINT
+        )""")
         self.conn.commit()
+
 
     def write_block(self, block: Dict[str, Any]) -> None:
         sql = """
@@ -62,7 +84,7 @@ class PostgresStorage(StorageManager):
         cur.execute(sql, val)
         self.conn.commit()
 
-    def query_blocks(self, start: int, end: int) -> List[Dict[str, Any]]:
+    def query_blocks(self, start: int, end: int) -> list[dict[str, Any]]:
         sql = """
         SELECT block_number, block_hash, timestamp
         FROM blocks

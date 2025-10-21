@@ -2,7 +2,7 @@ import requests
 from typing import Optional, Callable
 from common.settings import load_settings, Settings
 from ingestion.checkpoint import Checkpoint
-from storage.manager import StorageManager
+from storage.manager import get_storage
 from storage.sqlite_backend import SQLiteStorage
 
 settings = load_settings()

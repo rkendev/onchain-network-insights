@@ -36,3 +36,61 @@ CREATE TABLE IF NOT EXISTS transfers (
     PRIMARY KEY (tx_hash, contract, sender, recipient, block_number)
 );
 """
+
+
+BALANCES_VIEW_SQL = """
+CREATE VIEW IF NOT EXISTS balances_view AS
+SELECT contract,
+       address,
+       SUM(amt) AS balance
+FROM (
+    SELECT contract, "to"   AS address, value    AS amt FROM transfers
+    UNION ALL
+    SELECT contract, "from" AS address, -value   AS amt FROM transfers
+)
+GROUP BY contract, address;
+"""
+
+# --- View helpers for analytics (idempotent) -------------------------------
+
+def ensure_analytics_views(con):
+    """
+    Create lightweight views the dashboard expects.
+    Safe to call repeatedly.
+    """
+    cur = con.cursor()
+
+    # View: transfers_enriched
+    #   Flattens each transfer into +/- deltas for from/to addresses.
+    cur.execute("""
+    CREATE VIEW IF NOT EXISTS transfers_enriched AS
+    SELECT
+        contract,
+        "to"      AS address,
+        value     AS delta,
+        blockNumber
+    FROM transfers
+    UNION ALL
+    SELECT
+        contract,
+        "from"    AS address,
+        -value    AS delta,
+        blockNumber
+    FROM transfers;
+    """)
+
+    # View: mint_burn (optional metadata helper; zero-address mints/burns)
+    cur.execute("""
+    CREATE VIEW IF NOT EXISTS mint_burn AS
+    WITH zero AS (
+        SELECT lower('0x0000000000000000000000000000000000000000') AS z
+    )
+    SELECT
+        t.contract,
+        SUM(CASE WHEN lower(t."from") = z THEN t.value ELSE 0 END) AS total_minted,
+        SUM(CASE WHEN lower(t."to")   = z THEN t.value ELSE 0 END) AS total_burned
+    FROM transfers t, zero
+    GROUP BY t.contract;
+    """)
+
+    con.commit()

@@ -1,106 +1,36 @@
 # analytics/whales.py
 from __future__ import annotations
-from typing import Iterable, Dict, Any, List
 
-from analytics.token_holders import balances_as_of_sqlite
-from storage.sqlite_backend import SQLiteStorage
+import sqlite3
+from typing import Iterable, Tuple, Dict, Any
+
+from analytics.token_holders import holder_balances
 
 
-def find_whales_sqlite(
+def whales_table(
     db_path: str,
     contract: str,
-    min_balance: int,
-    as_of_block: int | None = None,
-) -> List[Dict[str, Any]]:
+    as_of: int | None,
+    threshold: int | float,
+    top_n: int = 1000,
+) -> Tuple[Iterable[Tuple[str, int]], Dict[str, Any]]:
     """
-    Return holders whose balance >= min_balance, sorted DESC by balance.
+    Return (rows, meta) for holders with balance >= threshold as of `as_of`.
+
+    rows: iterable of (address, balance) sorted desc.
+    meta: dict returned by holder_balances (augmented with 'threshold').
     """
-    balances = balances_as_of_sqlite(db_path, contract, as_of_block)
-    whales = [b for b in balances if int(b["balance"]) >= int(min_balance)]
-    # balances_as_of_sqlite already returns DESC by balance then address
-    return whales
+    with sqlite3.connect(db_path) as con:
+        rows_df, meta = holder_balances(
+            con=con,
+            contract=contract,
+            as_of=as_of,
+            top_n=top_n,
+        )
 
-
-def _balances_direct_sqlite(
-    db_path: str,
-    contract: str,
-    as_of_block: int | None,
-) -> List[int]:
-    """
-    Compute balances directly from transfers, excluding the zero address
-    (mints/burns) from holder totals.
-    Returns a descending list of integer balances.
-    """
-    ZERO = "0x0000000000000000000000000000000000000000"
-
-    sm = SQLiteStorage(db_path); sm.setup()
-    cur = sm.conn.cursor()
-
-    params = [contract]
-    block_clause = ""
-    if as_of_block is not None:
-        block_clause = "AND block_number <= ?"
-        params.append(as_of_block)
-
-    # Exclude the zero address on both sides of the UNION so it never
-    # contributes to holder balances or total supply.
-    sql = f"""
-    WITH moves AS (
-        SELECT sender AS addr, -value AS delta
-        FROM transfers
-        WHERE contract = ? {block_clause} AND sender <> '{ZERO}'
-        UNION ALL
-        SELECT recipient AS addr, value AS delta
-        FROM transfers
-        WHERE contract = ? {block_clause} AND recipient <> '{ZERO}'
-    ),
-    agg AS (
-        SELECT addr, COALESCE(SUM(delta), 0) AS balance
-        FROM moves
-        GROUP BY addr
-        HAVING balance != 0
-    )
-    SELECT balance
-    FROM agg
-    ORDER BY balance DESC, addr ASC
-    """
-    cur.execute(sql, params + params)
-    rows = cur.fetchall()
-    return [int(r[0]) for r in rows]
-
-
-def concentration_ratios_sqlite(
-    db_path: str,
-    contract: str,
-    ks: Iterable[int] = (1, 5, 10, 50, 100),
-    as_of_block: int | None = None,
-) -> Dict[int, float]:
-    """
-    Concentration ratios CR_k = sum(top k balances) / sum(all balances).
-    If there are fewer than k holders, CR_k uses all available holders.
-    Returns {k: ratio in [0,1]}.
-    """
-    ks_list = [int(k) for k in ks]
-
-    # Compute balances directly to avoid state/caching discrepancies.
-    vals = _balances_direct_sqlite(db_path, contract, as_of_block)
-    if not vals:
-        return {k: 0.0 for k in ks_list}
-
-    total = sum(vals)
-    if total <= 0:
-        return {k: 0.0 for k in ks_list}
-
-    # Prefix sums for fast top-k totals
-    prefix = []
-    run = 0
-    for v in vals:
-        run += int(v)
-        prefix.append(run)
-
-    out: Dict[int, float] = {}
-    n = len(prefix)
-    for k in ks_list:
-        kk = min(int(k), n)
-        out[int(k)] = prefix[kk - 1] / total
-    return out
+    # rows_df has columns ['address','balance'] already sorted desc
+    filtered = rows_df[rows_df["balance"] >= threshold]
+    out_rows = list(filtered[["address", "balance"]].itertuples(index=False, name=None))
+    meta = dict(meta or {})
+    meta["threshold"] = threshold
+    return out_rows, meta
