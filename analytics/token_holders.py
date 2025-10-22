@@ -1,199 +1,114 @@
-# analytics/token_holders.py
 from __future__ import annotations
 
-import math
+from typing import Dict, List, Tuple, Optional, Union
 import sqlite3
-from typing import Optional, Tuple, Dict, Any, List
 
-from storage.sqlite_backend import SQLiteStorage
-from ingestion.erc20_rpc import fetch_metadata as rpc_fetch_metadata, RpcError
+DBLike = Union[str, sqlite3.Connection]
 
+__all__ = [
+    "balances_as_of_sqlite",
+    "top_holders_sqlite",
+    "distribution_metrics",
+    "holder_deltas_window",
+    "top_gainers_spenders",
+]
 
-def get_or_fetch_metadata(db_path: str, contract: str, as_of_block: Optional[int] = None) -> dict:
-    sm = SQLiteStorage(db_path); sm.setup()
-    meta = sm.read_erc20_metadata(contract)
-    try:
-        if not meta or (as_of_block and (not meta.get("as_of_block") or meta["as_of_block"] < as_of_block)):
-            fetched = rpc_fetch_metadata(contract, as_of_block)
-            sm.upsert_erc20_metadata(
-                contract=fetched["contract"],
-                symbol=fetched["symbol"],
-                decimals=fetched["decimals"],
-                total_supply=fetched["total_supply"],
-                as_of_block=fetched["as_of_block"],
-            )
-            meta = sm.read_erc20_metadata(contract)
-    except RpcError as e:
-        # keep UI alive; return minimal metadata and let supply fall back to DB sum
-        meta = meta or {"contract": contract, "symbol": "", "decimals": 0, "total_supply": 0, "as_of_block": as_of_block or 0}
-        meta["_meta_warning"] = str(e)
-    return meta or {"contract": contract, "symbol": "", "decimals": 0, "total_supply": 0, "as_of_block": as_of_block or 0}
+def _connect(db: DBLike) -> sqlite3.Connection:
+    """Accept either a sqlite path or an open connection."""
+    if isinstance(db, sqlite3.Connection):
+        return db
+    return sqlite3.connect(db)
 
+def balances_as_of_sqlite(db: DBLike, contract: str, as_of_block: Optional[int] = None) -> Dict[str, int]:
+    """
+    Return address -> balance using transfers up to (and including) as_of_block.
+    Expects a 'transfers' table with columns: contract, "from", "to", value, blockNumber.
+    """
+    con = _connect(db)
+    params = {"contract": contract}
+    where = 'contract = :contract'
+    if as_of_block is not None:
+        where += ' AND blockNumber <= :asof'
+        params["asof"] = int(as_of_block)
+    sql = f"""
+        WITH deltas AS (
+          SELECT "to"   AS addr, value  AS delta FROM transfers WHERE {where}
+          UNION ALL
+          SELECT "from" AS addr, -value AS delta FROM transfers WHERE {where}
+        )
+        SELECT addr, SUM(delta) AS bal
+        FROM deltas
+        GROUP BY addr
+        HAVING bal != 0
+    """
+    rows = con.execute(sql, params).fetchall()
+    return {addr: int(bal) for addr, bal in rows}
 
-def _sum_balances_sqlite(con: sqlite3.Connection, contract: str, as_of_block: Optional[int]) -> int:
-    if as_of_block and as_of_block > 0:
-        row = con.execute(
-            """
-            SELECT COALESCE(SUM(value), 0) FROM (
-              SELECT recipient AS addr, SUM(value) AS value
-              FROM transfers
-              WHERE contract=? AND block_number <= ?
-              GROUP BY recipient
-              UNION ALL
-              SELECT sender AS addr, -SUM(value) AS value
-              FROM transfers
-              WHERE contract=? AND block_number <= ?
-              GROUP BY sender
-            )
-            """, (contract.lower(), as_of_block, contract.lower(), as_of_block)
-        ).fetchone()
+def top_holders_sqlite(db: DBLike, contract: str, n: int = 10, as_of_block: Optional[int] = None) -> List[Tuple[str, int]]:
+    bals = balances_as_of_sqlite(db, contract, as_of_block=as_of_block)
+    return sorted(bals.items(), key=lambda x: x[1], reverse=True)[:int(n)]
+
+def distribution_metrics(db: DBLike, contract: str, as_of_block: Optional[int] = None) -> Dict[str, float]:
+    """Return {holders, total_supply, gini, cr10, last_block} for the contract."""
+    con = _connect(db)
+    bals = balances_as_of_sqlite(con, contract, as_of_block=as_of_block)
+    holders = len(bals)
+    total = sum(bals.values()) if holders else 0
+
+    # gini
+    if holders <= 1 or total == 0:
+        gini = 0.0
     else:
-        row = con.execute(
-            """
-            SELECT COALESCE(SUM(value), 0) FROM (
-              SELECT recipient AS addr, SUM(value) AS value
-              FROM transfers
-              WHERE contract=?
-              GROUP BY recipient
-              UNION ALL
-              SELECT sender AS addr, -SUM(value) AS value
-              FROM transfers
-              WHERE contract=?
-              GROUP BY sender
-            )
-            """, (contract.lower(), contract.lower())
-        ).fetchone()
-    return int(row[0] or 0)
+        xs = sorted(bals.values())
+        cum = 0
+        for i, x in enumerate(xs, 1):
+            cum += i * x
+        gini = (2 * cum) / (holders * total) - (holders + 1) / holders
 
+    top10 = sum(v for _, v in sorted(bals.items(), key=lambda x: x[1], reverse=True)[:10])
+    cr10 = (top10 / total * 100.0) if total else 0.0
 
-def holder_balances(con, contract: str, as_of: int | None, top_n: int = 10):
-    """
-    Return (rows_df, meta_dict) for the top-N holders at an optional as-of block.
-    Works directly over `transfers_enriched` (no `direction` column required).
-    """
-    params = [contract.lower()]
-    asof_clause = ""
-    if as_of is not None and as_of > 0:
-        asof_clause = "AND blockNumber <= ?"
-        params.append(as_of)
-
-    # Aggregate balances from deltas
-    sql = f"""
-    WITH addr_bal AS (
-      SELECT
-        contract,
-        address,
-        SUM(delta) AS balance
-      FROM transfers_enriched
-      WHERE lower(contract) = ?
-        {asof_clause}
-      GROUP BY contract, address
-    )
-    SELECT address, balance
-    FROM addr_bal
-    WHERE balance > 0
-    ORDER BY balance DESC
-    LIMIT {int(top_n)}
-    """
-    rows = con.execute(sql, tuple(params)).fetchall()
-
-    # Metadata: holders count & total supply proxy (mints - burns)
-    holders_sql = f"""
-    WITH addr_bal AS (
-      SELECT contract, address, SUM(delta) AS balance
-      FROM transfers_enriched
-      WHERE lower(contract) = ?
-        {asof_clause}
-      GROUP BY contract, address
-    )
-    SELECT
-      SUM(CASE WHEN balance > 0 THEN 1 ELSE 0 END)             AS holders,
-      COALESCE((
-        SELECT mb.total_minted - mb.total_burned
-        FROM mint_burn mb
-        WHERE lower(mb.contract) = ?
-      ), 0)                                                    AS total_supply
-    FROM addr_bal
-    """
-    holders_params = [contract.lower()]
-    if as_of is not None and as_of > 0:
-        holders_params.append(as_of)
-    holders_params.append(contract.lower())
-    meta_row = con.execute(holders_sql, tuple(holders_params)).fetchone()
-    meta = {"holders": meta_row[0] or 0, "total_supply": meta_row[1] or 0}
-
-    # Convert to DataFrame the way your app expects
-    import pandas as pd
-    df = pd.DataFrame(rows, columns=["address", "balance"])
-    return df, meta
-
-
-def holder_balances(con, contract: str, as_of: int | None, top_n: int = 10):
-    """
-    Return (top_df, meta) where top_df has columns [address, balance] and meta has
-    at least {"symbol": str, "decimals": int}.
-    """
-    # read metadata (if present)
-    meta = {"symbol": None, "decimals": 18}
-    try:
-        row = con.execute(
-            "SELECT symbol, decimals FROM metadata WHERE contract = ? LIMIT 1",
+    # last_block (<= as_of_block if provided; otherwise max for contract)
+    if as_of_block is not None:
+        last = con.execute(
+            "SELECT COALESCE(MAX(blockNumber), 0) FROM transfers WHERE contract = ? AND blockNumber <= ?",
+            (contract, int(as_of_block)),
+        ).fetchone()[0]
+    else:
+        last = con.execute(
+            "SELECT COALESCE(MAX(blockNumber), 0) FROM transfers WHERE contract = ?",
             (contract,),
-        ).fetchone()
-        if row:
-            meta["symbol"] = row[0]
-            meta["decimals"] = int(row[1]) if row[1] is not None else 18
-    except Exception:
-        pass
+        ).fetchone()[0]
 
-    # Base query: balances as-of (current or <= block_number)
-    params = [contract]
-    where_cutoff = ""
-    if as_of and as_of > 0:
-        where_cutoff = "AND block_number <= ?"
-        params.append(as_of)
+    return {
+        "holders": float(holders),
+        "total_supply": float(total),
+        "gini": float(gini),
+        "cr10": float(cr10),
+        "last_block": float(last),
+    }
 
-    # NOTE: adjust this SELECT to your actual balance materialization.
-    # If you store latest balances in a table, use that table.
-    sql = f"""
-    WITH agg AS (
-      SELECT
-        address,
-        SUM(CASE WHEN direction = 'in' THEN value ELSE -value END) AS balance
-      FROM balances_view  -- or your materialized balances source
-      WHERE contract = ? {where_cutoff}
-      GROUP BY address
-    )
-    SELECT address, balance
-    FROM agg
-    WHERE balance > 0
-    ORDER BY balance DESC
-    LIMIT ?
-    """
-    params.append(top_n)
+def holder_deltas_window(
+    db: DBLike,
+    contract: str,
+    start_block_exclusive: int,
+    end_block_inclusive: int,
+) -> Dict[str, int]:
+    """Balance change between (start,end] — start is exclusive, end is inclusive."""
+    before = balances_as_of_sqlite(db, contract, as_of_block=start_block_exclusive)
+    after  = balances_as_of_sqlite(db, contract, as_of_block=end_block_inclusive)
+    addrs = set(before) | set(after)
+    return {a: int(after.get(a, 0) - before.get(a, 0)) for a in addrs}
 
-    rows = con.execute(sql, tuple(params)).fetchall()
-    df = pd.DataFrame(rows, columns=["address", "balance"])
-    return df, meta
-
-
-def gini_coefficient(balances_raw: List[int]) -> float:
-    if not balances_raw:
-        return 0.0
-    x = sorted([max(0, int(v)) for v in balances_raw])
-    n = len(x)
-    s = sum(x)
-    if s == 0:
-        return 0.0
-    cum = 0
-    for i, xi in enumerate(x, start=1):
-        cum += i * xi
-    # Gini = (2*sum(i*xi)/(n*sum(x)) - (n+1)/n)
-    return (2 * cum / (n * s)) - (n + 1) / n
-
-
-def concentration_ratio_k(balances_raw: List[int], k: int, total_supply_raw: int) -> float:
-    if total_supply_raw <= 0:
-        return 0.0
-    top = sum(sorted(balances_raw, reverse=True)[:k])
-    return top / float(total_supply_raw)
+def top_gainers_spenders(
+    db: DBLike,
+    contract: str,
+    start_block_exclusive: int,
+    end_block_inclusive: int,
+    top: int = 5,
+) -> Tuple[List[str], List[str]]:
+    """Return (gainers, spenders) lists ordered by absolute delta size."""
+    deltas = holder_deltas_window(db, contract, start_block_exclusive, end_block_inclusive)
+    gainers = [a for a, d in sorted(deltas.items(), key=lambda x: x[1], reverse=True) if d > 0][:top]
+    spenders = [a for a, d in sorted(deltas.items(), key=lambda x: x[1]) if d < 0][:top]
+    return gainers, spenders

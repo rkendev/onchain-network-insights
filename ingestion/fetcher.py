@@ -137,7 +137,7 @@ def ingest_incremental(
 
     cp.update(end)
     return end
-    
+
 
 def ingestion_pipeline(use_postgres: bool = False):
     if use_postgres:

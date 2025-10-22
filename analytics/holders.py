@@ -1,139 +1,100 @@
-# analytics/holders.py
 from __future__ import annotations
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
+import sqlite3
+import math
 
-from analytics.token_holders import balances_as_of_sqlite
-from storage.sqlite_backend import SQLiteStorage
+def _connect(db_path: str) -> sqlite3.Connection:
+    return sqlite3.connect(db_path)
 
-
-def holder_balances_sqlite(
-    db_path: str, contract: str, as_of_block: Optional[int] = None
-) -> List[Dict[str, Any]]:
+def holder_balances_sqlite(db_path: str, contract: str, as_of_block: Optional[int] = None) -> List[Dict[str, int]]:
     """
-    Thin wrapper around balances_as_of_sqlite to centralize holder analytics entry-point.
-    Returns [{address, balance}] sorted by balance DESC, then address ASC.
+    Returns list of {"address": str, "balance": int} as of (<=) as_of_block.
+    Uses transfers(sender, recipient, value, block_number).
     """
-    return balances_as_of_sqlite(db_path, contract, as_of_block)
-
-
-def _address_deltas_sqlite(
-    db_path: str, contract: str, start_block: int, end_block: int
-) -> List[Tuple[str, int]]:
-    """
-    Compute net delta per address in (start_block, end_block] (exclusive of start, inclusive of end),
-    using the transfers table directly. Positive = net inflow, Negative = net outflow.
-    Returns list of (address, delta) including only non-zero deltas, sorted by |delta| DESC then address.
-    """
-    sm = SQLiteStorage(db_path)
-    sm.setup()
-    cur = sm.conn.cursor()
-
-    # Filter transfers strictly after start_block up to and including end_block
-    # (so you can use start_block as the previous snapshot boundary).
-    sql = """
-    WITH windowed AS (
-        SELECT sender AS addr, -value AS delta
-        FROM transfers
-        WHERE contract = ? AND block_number > ? AND block_number <= ?
+    con = _connect(db_path)
+    params = {"contract": contract}
+    clause = "contract = :contract"
+    if as_of_block is not None:
+        clause += " AND block_number <= :asof"
+        params["asof"] = int(as_of_block)
+    sql = f"""
+      WITH deltas AS (
+        SELECT recipient AS address, value      AS delta FROM transfers WHERE {clause}
         UNION ALL
-        SELECT recipient AS addr, value AS delta
-        FROM transfers
-        WHERE contract = ? AND block_number > ? AND block_number <= ?
-    ),
-    agg AS (
-        SELECT addr, COALESCE(SUM(delta),0) AS delta
-        FROM windowed
-        GROUP BY addr
-        HAVING delta <> 0
-    )
-    SELECT addr, delta
-    FROM agg
-    ORDER BY ABS(delta) DESC, addr ASC
+        SELECT sender    AS address, -1*value   AS delta FROM transfers WHERE {clause}
+      )
+      SELECT address, SUM(delta) AS balance
+      FROM deltas
+      GROUP BY address
+      HAVING balance != 0
+      ORDER BY balance DESC
     """
-    params = [contract, start_block, end_block, contract, start_block, end_block]
-    cur.execute(sql, params)
-    return [(r[0], int(r[1])) for r in cur.fetchall()]
+    rows = con.execute(sql, params).fetchall()
+    return [{"address": a, "balance": int(b)} for (a, b) in rows]
 
-
-def holder_deltas_sqlite(
-    db_path: str, contract: str, start_block: int, end_block: int
-) -> List[Dict[str, Any]]:
+def holder_deltas_sqlite(db_path: str, contract: str, start_block: int, end_block: int) -> Dict[str, int]:
     """
-    Return list of {address, delta} for the given window.
+    Net balance change between (start_block, end_block].
     """
-    return [
-        {"address": addr, "delta": delta}
-        for addr, delta in _address_deltas_sqlite(db_path, contract, start_block, end_block)
-    ]
+    before = holder_balances_sqlite(db_path, contract, as_of_block=start_block)
+    after  = holder_balances_sqlite(db_path, contract, as_of_block=end_block)
+    bmap = {x["address"]: int(x["balance"]) for x in before}
+    amap = {x["address"]: int(x["balance"]) for x in after}
+    addrs = set(bmap) | set(amap)
+    return {a: int(amap.get(a, 0) - bmap.get(a, 0)) for a in addrs}
 
+def top_gainers_sqlite(db_path: str, contract: str, n: int, start_block: int, end_block: int) -> List[str]:
+    deltas = holder_deltas_sqlite(db_path, contract, start_block, end_block)
+    ordered = sorted(deltas.items(), key=lambda kv: kv[1], reverse=True)
+    return [a for a, d in ordered if d > 0][:int(n)]
 
-def top_gainers_sqlite(
-    db_path: str, contract: str, n: int, start_block: int, end_block: int
-) -> List[Dict[str, Any]]:
+def top_spenders_sqlite(db_path: str, contract: str, n: int, start_block: int, end_block: int) -> List[str]:
+    deltas = holder_deltas_sqlite(db_path, contract, start_block, end_block)
+    ordered = sorted(deltas.items(), key=lambda kv: kv[1])  # most negative first
+    return [a for a, d in ordered if d < 0][:int(n)]
+
+def distribution_metrics_sqlite(db_path: str, contract: str, as_of_block: Optional[int] = None) -> Dict[str, float]:
     """
-    Addresses with largest positive delta in the window.
+    Returns {"holders", "total_supply", "gini", "hhi", "last_block"}.
+    holders/total_supply are counts from positive balances only for distribution.
     """
-    rows = _address_deltas_sqlite(db_path, contract, start_block, end_block)
-    return [{"address": a, "delta": d} for (a, d) in rows if d > 0][:n]
+    con = _connect(db_path)
+    bals = holder_balances_sqlite(db_path, contract, as_of_block)
+    positives = [int(x["balance"]) for x in bals if int(x["balance"]) > 0 and str(x["address"]).lower() != "0x0000000000000000000000000000000000000000"]
+    holders = len(positives)
+    total = int(sum(positives)) if holders else 0
 
+    # gini
+    if holders <= 1 or total == 0:
+        gini = 0.0
+    else:
+        xs = sorted(positives)
+        n = len(xs)
+        cum = sum((i + 1) * x for i, x in enumerate(xs))
+        gini = (2 * cum) / (n * total) - (n + 1) / n
 
-def top_spenders_sqlite(
-    db_path: str, contract: str, n: int, start_block: int, end_block: int
-) -> List[Dict[str, Any]]:
-    """
-    Addresses with largest negative (most outflow) delta in the window.
-    """
-    rows = _address_deltas_sqlite(db_path, contract, start_block, end_block)
-    neg = [(a, d) for (a, d) in rows if d < 0]
-    # rows already sorted by |delta| DESC, so just take first n of negatives
-    return [{"address": a, "delta": d} for (a, d) in neg][:n]
+    # HHI (shares squared sum)
+    hhi = 0.0
+    if total > 0:
+        shares = [x / total for x in positives]
+        hhi = float(sum(s * s for s in shares))
 
+    # last block (respect as_of if provided)
+    if as_of_block is not None:
+        last = con.execute(
+            "SELECT COALESCE(MAX(block_number),0) FROM transfers WHERE contract=? AND block_number <= ?",
+            (contract, int(as_of_block))
+        ).fetchone()[0]
+    else:
+        last = con.execute(
+            "SELECT COALESCE(MAX(block_number),0) FROM transfers WHERE contract=?",
+            (contract,)
+        ).fetchone()[0]
 
-def distribution_metrics_sqlite(
-    db_path: str, contract: str, as_of_block: Optional[int] = None
-) -> Dict[str, float]:
-    """
-    Simple distribution metrics for holder balances:
-      - gini: Gini coefficient in [0,1]
-      - hhi: Herfindahl-Hirschman Index in [0,1] (sum of squared shares)
-
-    Excludes the zero address (mint/burn) and non-positive balances.
-    """
-    ZERO = "0x0000000000000000000000000000000000000000"
-
-    bals = balances_as_of_sqlite(db_path, contract, as_of_block)
-
-    # Keep only positive balances for real holder distribution; drop zero address.
-    vals = [
-        int(x["balance"])
-        for x in bals
-        if int(x["balance"]) > 0 and str(x["address"]).lower() != ZERO
-    ]
-
-    if not vals:
-        return {"gini": 0.0, "hhi": 0.0}
-
-    total = sum(vals)
-    if total <= 0:
-        return {"gini": 0.0, "hhi": 0.0}
-
-    # HHI
-    shares = [v / total for v in vals]
-    hhi = sum(s * s for s in shares)
-
-    # Gini (sorted ascending)
-    xs = sorted(vals)
-    n = len(xs)
-    cum = 0
-    weighted_sum = 0
-    for i, v in enumerate(xs, start=1):
-        cum += v
-        weighted_sum += cum
-    # Gini using cumulative areas
-    gini = 1 - (2 * weighted_sum) / (n * total) + 1 / n
-
-    # Clip to [0,1]
-    gini = max(0.0, min(1.0, gini))
-    hhi = max(0.0, min(1.0, hhi))
-    return {"gini": gini, "hhi": hhi}
-
+    return {
+        "holders": float(holders),
+        "total_supply": float(total),
+        "gini": float(gini),
+        "hhi": float(hhi),
+        "last_block": float(last),
+    }
