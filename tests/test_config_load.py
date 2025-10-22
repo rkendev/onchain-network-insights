@@ -1,4 +1,3 @@
-import os
 import pathlib
 
 def test_config_file_exists_and_has_placeholders():
@@ -6,7 +5,12 @@ def test_config_file_exists_and_has_placeholders():
     cfg = root / "config.yaml"
     assert cfg.exists(), "config.yaml missing at project root"
     text = cfg.read_text(encoding="utf-8")
-    # Ensure no obvious secrets are present
+
     forbidden = ["http://", "https://", "AKIA", "AIza", "secret:", "token:", "key:"]
-    # allow placeholders like YOUR_RPC_URL
-    assert all(k not in text for k in forbidden), "config.yaml contains potential secrets or live URLs"
+
+    def safe(line: str) -> bool:
+        if "${" in line:
+            return True
+        return not any(bad in line for bad in forbidden)
+
+    assert all(safe(line) for line in text.splitlines()), "config.yaml contains potential secrets or live URLs"

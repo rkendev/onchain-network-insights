@@ -1,15 +1,20 @@
-# config.yaml
-data_source: rpc
+data_source:
+  network: "ethereum"
+  rpc:
+    url: "${RPC_URL}"
+providers:
+  etherscan:
+    api_key: "${ETHERSCAN_API_KEY}"
 
-bigquery:
-  project_id: your-project-id
-  dataset: ethereum
+db:
+  driver: "sqlite"
+  sqlite_path: "sandbox_whales.db"
 
-rpc:
-  url: "https://mainnet.infura.io/v3/276f912c1d174836b7865519f2bb9fe6"
-
-api:
-  etherscan_key: 276f912c1d174836b7865519f2bb9fe6
+ingestion:
+  start_block: 21000000
+  end_block: 21001000
+  max_retries: 3
+  backoff_seconds: 1.5
 
 checkpoint:
-  file: checkpoint.json
+  path: "checkpoint.json"
