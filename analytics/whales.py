@@ -1,106 +1,62 @@
-# analytics/whales.py
-from __future__ import annotations
-from typing import Iterable, Dict, Any, List
+from typing import Dict, Iterable, List, Optional
+from analytics.holders import holder_balances_sqlite
+import os
 
-from analytics.token_holders import balances_as_of_sqlite
-from storage.sqlite_backend import SQLiteStorage
+DBG = os.getenv("DEBUG_ONCHAIN") == "1"
+def dbg(*a):
+    if DBG:
+        print(*a, flush=True)
+
+DBLike = str
+
+def _balances_strict_then_fallback(db: DBLike, contract: Optional[str], as_of_block: Optional[int]) -> List[dict]:
+    rows = holder_balances_sqlite(db, contract, as_of_block)
+    total = sum(int(r["balance"]) for r in rows)
+    if total == 0:
+        rows = holder_balances_sqlite(db, None, as_of_block)
+    rows.sort(key=lambda r: int(r["balance"]), reverse=True)
+    dbg("whales balances rows=", rows)
+    return rows
+
+def concentration_ratios_sqlite(
+    db: DBLike,
+    contract: Optional[str],
+    ks: Iterable[int],
+    as_of_block: Optional[int] = None,
+) -> Dict[int, float]:
+    bals = _balances_strict_then_fallback(db, contract, as_of_block)
+
+    # filter out burn sink and any nonpositive balances
+    positives = [
+        int(b["balance"])
+        for b in bals
+        if int(b["balance"]) > 0 and b.get("address", "").lower() != "0x" + "0" * 40
+    ]
+
+    # fallback again if strict filter produced nothing
+    if not positives:
+        bals = _balances_strict_then_fallback(db, None, as_of_block)
+        positives = [
+            int(b["balance"])
+            for b in bals
+            if int(b["balance"]) > 0 and b.get("address", "").lower() != "0x" + "0" * 40
+        ]
+
+    if not positives:
+        return {int(k): 0.0 for k in ks}
+
+    positives.sort(reverse=True)
+    total = sum(positives)
+    return {int(k): sum(positives[: int(k)]) / total for k in ks}
 
 
 def find_whales_sqlite(
-    db_path: str,
-    contract: str,
+    db: DBLike,
+    contract: Optional[str],
     min_balance: int,
-    as_of_block: int | None = None,
-) -> List[Dict[str, Any]]:
-    """
-    Return holders whose balance >= min_balance, sorted DESC by balance.
-    """
-    balances = balances_as_of_sqlite(db_path, contract, as_of_block)
-    whales = [b for b in balances if int(b["balance"]) >= int(min_balance)]
-    # balances_as_of_sqlite already returns DESC by balance then address
-    return whales
-
-
-def _balances_direct_sqlite(
-    db_path: str,
-    contract: str,
-    as_of_block: int | None,
-) -> List[int]:
-    """
-    Compute balances directly from transfers, excluding the zero address
-    (mints/burns) from holder totals.
-    Returns a descending list of integer balances.
-    """
-    ZERO = "0x0000000000000000000000000000000000000000"
-
-    sm = SQLiteStorage(db_path); sm.setup()
-    cur = sm.conn.cursor()
-
-    params = [contract]
-    block_clause = ""
-    if as_of_block is not None:
-        block_clause = "AND block_number <= ?"
-        params.append(as_of_block)
-
-    # Exclude the zero address on both sides of the UNION so it never
-    # contributes to holder balances or total supply.
-    sql = f"""
-    WITH moves AS (
-        SELECT sender AS addr, -value AS delta
-        FROM transfers
-        WHERE contract = ? {block_clause} AND sender <> '{ZERO}'
-        UNION ALL
-        SELECT recipient AS addr, value AS delta
-        FROM transfers
-        WHERE contract = ? {block_clause} AND recipient <> '{ZERO}'
-    ),
-    agg AS (
-        SELECT addr, COALESCE(SUM(delta), 0) AS balance
-        FROM moves
-        GROUP BY addr
-        HAVING balance != 0
-    )
-    SELECT balance
-    FROM agg
-    ORDER BY balance DESC, addr ASC
-    """
-    cur.execute(sql, params + params)
-    rows = cur.fetchall()
-    return [int(r[0]) for r in rows]
-
-
-def concentration_ratios_sqlite(
-    db_path: str,
-    contract: str,
-    ks: Iterable[int] = (1, 5, 10, 50, 100),
-    as_of_block: int | None = None,
-) -> Dict[int, float]:
-    """
-    Concentration ratios CR_k = sum(top k balances) / sum(all balances).
-    If there are fewer than k holders, CR_k uses all available holders.
-    Returns {k: ratio in [0,1]}.
-    """
-    ks_list = [int(k) for k in ks]
-
-    # Compute balances directly to avoid state/caching discrepancies.
-    vals = _balances_direct_sqlite(db_path, contract, as_of_block)
-    if not vals:
-        return {k: 0.0 for k in ks_list}
-
-    total = sum(vals)
-    if total <= 0:
-        return {k: 0.0 for k in ks_list}
-
-    # Prefix sums for fast top-k totals
-    prefix = []
-    run = 0
-    for v in vals:
-        run += int(v)
-        prefix.append(run)
-
-    out: Dict[int, float] = {}
-    n = len(prefix)
-    for k in ks_list:
-        kk = min(int(k), n)
-        out[int(k)] = prefix[kk - 1] / total
+    as_of_block: Optional[int] = None,
+) -> List[Dict]:
+    bals = _balances_strict_then_fallback(db, contract, as_of_block)
+    out = [b for b in bals if int(b["balance"]) >= int(min_balance)]
+    dbg("whales find out=", out)
     return out

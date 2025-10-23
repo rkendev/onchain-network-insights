@@ -1,53 +1,37 @@
-from typing import Optional, List, Dict, Any
-from storage.sqlite_backend import SQLiteStorage
+from typing import Dict, List, Optional
+import sqlite3
 
-def balances_as_of_sqlite(db_path: str, contract: str, as_of_block: Optional[int] = None) -> List[Dict[str, Any]]:
-    """
-    Compute holder balances for a given ERC-20 contract as of an optional block number.
-    Returns a list of {address, balance} (balance is integer).
-    """
-    sm = SQLiteStorage(db_path)
-    sm.setup()
-    cur = sm.conn.cursor()
+DBPath = str
 
-    # Filter on contract, optional block
-    params = [contract]
-    block_clause = ""
+def _connect(db: DBPath) -> sqlite3.Connection:
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    return con
+
+def balances_as_of_sqlite(db: DBPath, contract: str, as_of_block: Optional[int] = None) -> List[Dict]:
+    """
+    Mirror of holders.holder_balances_sqlite kept for backward calls
+    """
+    con = _connect(db)
+    where = "1=1"
+    params = {}
     if as_of_block is not None:
-        block_clause = "AND block_number <= ?"
-        params.append(as_of_block)
-
-    # Sum inflows - outflows per address
-    # We use sender/recipient columns (set in erc20-store branch)
+        where += " AND block_number <= :asof"
+        params["asof"] = int(as_of_block)
     sql = f"""
-    WITH moves AS (
-        SELECT sender AS addr, -value AS delta
-        FROM transfers
-        WHERE contract = ? {block_clause}
-        UNION ALL
-        SELECT recipient AS addr, value AS delta
-        FROM transfers
-        WHERE contract = ? {block_clause}
-    ),
-    agg AS (
-        SELECT addr, COALESCE(SUM(delta), 0) AS balance
-        FROM moves
+        WITH deltas AS (
+          SELECT recipient AS addr, value  AS delta FROM transfers WHERE {where}
+          UNION ALL
+          SELECT sender    AS addr, -value AS delta FROM transfers WHERE {where}
+        )
+        SELECT addr AS address, SUM(delta) AS balance
+        FROM deltas
         GROUP BY addr
         HAVING balance != 0
-    )
-    SELECT addr AS address, balance
-    FROM agg
-    ORDER BY balance DESC, address ASC
+        ORDER BY balance DESC
     """
-    # params need to match placeholders: (contract,[as_of] ; contract,[as_of])
-    final_params = params + params  # duplicate for recipient side
-    cur.execute(sql, final_params)
-    rows = cur.fetchall()
-    return [{"address": r[0], "balance": int(r[1])} for r in rows]
+    rows = con.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
 
-def top_holders_sqlite(db_path: str, contract: str, n: int = 10, as_of_block: Optional[int] = None) -> List[Dict[str, Any]]:
-    """
-    Convenience wrapper: return top N holders by balance.
-    """
-    bals = balances_as_of_sqlite(db_path, contract, as_of_block)
-    return bals[:n]
+def top_holders_sqlite(db: DBPath, contract: str, n: int = 10, as_of_block: Optional[int] = None) -> List[Dict]:
+    return balances_as_of_sqlite(db, contract, as_of_block)[: int(n)]

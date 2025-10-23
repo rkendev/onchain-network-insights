@@ -3,3 +3,6 @@ PyYAML
 requests
 pytest
 psycopg2-binary
+streamlit>=1.37
+plotly>=5.24
+pandas>=2.2
