@@ -10,6 +10,8 @@ def test_etl_persists_to_sqlite(tmp_path, monkeypatch):
     }
     monkeypatch.setattr("etl.extract.extract_block", lambda _: fake_raw)
 
+    print("--------------------------tmp path------"+str(tmp_path))
+
     # 2) Use a temp sqlite path for this test
     db_path = tmp_path / "etl_integration.db"
 

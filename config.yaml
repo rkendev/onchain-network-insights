@@ -1,7 +1,10 @@
-data_source:
-  network: "ethereum"
-  rpc:
-    url: "${RPC_URL}"
+data_source: "rpc"
+
+network: "ethereum"
+
+rpc:
+  url: "${RPC_URL}"
+
 providers:
   etherscan:
     api_key: "${ETHERSCAN_API_KEY}"
@@ -17,4 +20,4 @@ ingestion:
   backoff_seconds: 1.5
 
 checkpoint:
-  path: "checkpoint.json"
+  file: "checkpoint.json"

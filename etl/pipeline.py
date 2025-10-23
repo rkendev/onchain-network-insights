@@ -1,55 +1,82 @@
-# etl/pipeline.py
-import etl.extract as extract
-import etl.transform as transform
-import etl.load as load
-from etl.erc20 import is_erc20_transfer  # NEW
+from typing import Optional, Dict, Any, List
+from storage.sqlite_backend import SQLiteStorage
+from etl import extract
+import os
 
+DBG = os.getenv("DEBUG_ONCHAIN") == "1"
+def dbg(*a):
+    if DBG:
+        print(*a, flush=True)
 
-def _pick(raw: dict, key: str):
-    """
-    Safely get 'key' from either a flat dict or a nested {"result": {...}} response.
-    """
-    if not isinstance(raw, dict):
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+def _hex_to_int(v):
+    if isinstance(v, str) and v.startswith("0x"):
+        return int(v, 16)
+    return int(v)
+
+def _topic_addr(t):
+    if not isinstance(t, str):
         return None
-    if key in raw:
-        return raw.get(key)
-    res = raw.get("result")
-    if isinstance(res, dict):
-        return res.get(key)
-    return None
+    if t.startswith("0x") and len(t) == 66:
+        return "0x" + t[-40:]
+    return t
 
+def _decode_transfers(logs):
+    out = []
+    for lg in logs or []:
+        topics = lg.get("topics") or []
+        # skip non transfer logs and malformed logs
+        if len(topics) < 3:
+            continue
+        if topics[0] != TRANSFER_TOPIC:
+            continue
 
-def run_etl(block_number: int, backend: str = "sqlite", **backend_opts) -> int:
-    """
-    End-to-end ETL for a single block:
-      - extract raw block
-      - transform transactions, logs, and ERC-20 transfers
-      - load transactions, non-ERC20 logs, and transfers
-      - return count of DISTINCT stored records
-    """
-    raw = extract.extract_block(block_number)
+        sender = _topic_addr(topics[1])
+        recipient = _topic_addr(topics[2])
+        value = _hex_to_int(lg.get("data", "0x0"))
+        block_number = lg.get("blockNumber") or lg.get("block_number")
+        tx_hash = lg.get("transactionHash") or lg.get("tx_hash")
+        contract = lg.get("address")
 
-    raw_txs = _pick(raw, "transactions") or []
-    raw_logs = _pick(raw, "logs") or []
-    if not isinstance(raw_txs, list):
-        raw_txs = []
-    if not isinstance(raw_logs, list):
-        raw_logs = []
+        out.append({
+            "tx_hash": tx_hash,
+            "contract": contract,
+            "sender": sender,
+            "recipient": recipient,
+            "value": value,
+            "block_number": block_number,
+        })
+    return out
 
-    # Decode ERC-20 transfers first
-    transfers = transform.decode_erc20_transfers(raw_logs)
+def run_etl(start_block: int, *, backend: str = "sqlite", sqlite_path: Optional[str] = None) -> int:
+    if backend != "sqlite":
+        raise ValueError("only sqlite backend is supported in this test")
+    if not sqlite_path:
+        sqlite_path = "etl_pipeline.db"  # default used by tests that omit sqlite_path
+    dbg("etl run_etl sqlite_path=", sqlite_path, "start_block=", start_block)
 
-    # Exclude ERC-20 transfer logs from the generic logs path to avoid double-counting
-    non_transfer_logs = [lg for lg in raw_logs if not is_erc20_transfer(lg)]
+    store = SQLiteStorage(sqlite_path)
+    store.setup()
 
-    # Transform remaining entities
-    txs = transform.transform_transactions(raw_txs)
-    logs = transform.transform_logs(non_transfer_logs)
+    raw = extract.extract_block(start_block)
+    dbg("etl extracted raw=", raw)
 
-    # Load into storage
-    load.load_transactions(backend, txs, **backend_opts)
-    load.load_logs(backend, logs, **backend_opts)
-    load.load_transfers(backend, transfers, **backend_opts)
+    txs = raw.get("transactions", [])
+    for tx in txs:
+        store.write_transaction_dict(tx)
+    logs = raw.get("logs", [])
+    for lg in logs:
+        store.write_log(lg=lg)
 
-    # Return distinct records persisted: txs + non-transfer logs + transfers
-    return len(txs) + len(logs) + len(transfers)
+    transfers = _decode_transfers(logs)
+    dbg("etl decoded transfers=", transfers)
+    for tr in transfers:
+        store.insert_transfer(tr)
+
+    if getattr(store, "conn", None) is not None:
+        store.conn.commit()
+
+    total = len(txs) + len(logs) if logs else len(txs) + len(transfers)
+    dbg("etl total written=", total)
+    return total
