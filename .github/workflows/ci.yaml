@@ -1,8 +1,8 @@
-name: CI / Python Build & Test
+name: test
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, feature/** ]
   pull_request:
     branches: [ main ]
 
@@ -11,22 +11,80 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [ "3.10", "3.11", "3.12" ]
+        python-version: ['3.12']
+
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
+
+      - name: Install system sqlite3 (for debug/use)
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest-cov coverage-badge
 
-      - name: Run tests
-        run: pytest -q
+      - name: Prepare test SQLite DB
+        env:
+          TEST_DB: data/test.db
+          ONI_OFFLINE: "1"
+        run: |
+          mkdir -p data
+          python - <<'PY'
+          import sqlite3, os
+          db = os.environ["TEST_DB"]
+          con = sqlite3.connect(db)
+          cur = con.cursor()
+          cur.executescript("""
+          DROP TABLE IF EXISTS balances;
+          DROP TABLE IF EXISTS transfers;
+          CREATE TABLE balances(
+            contract TEXT,
+            block_number INTEGER,
+            address TEXT,
+            balance_units INTEGER
+          );
+          CREATE TABLE transfers(
+            contract TEXT,
+            block_number INTEGER,
+            from_address TEXT,
+            to_address TEXT,
+            value_units INTEGER
+          );
+          INSERT INTO balances VALUES
+          ('0xTEST', 3, '0xA', 200),
+          ('0xTEST', 3, '0xB', 300),
+          ('0xTEST', 5, '0xB', 400),
+          ('0xTEST', 5, '0xC', 100);
+          INSERT INTO transfers VALUES
+          ('0xTEST', 3, '0xA', '0xB', 50),
+          ('0xTEST', 5, '0xB', '0xC', 25);
+          """)
+          con.commit()
+          con.close()
+          PY
+          sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM balances;"
+
+      - name: Run tests with coverage
+        env:
+          # Make the app import-safe:
+          ONI_DASHBOARD_TEST_MODE: "1"
+          # Let your code pick this up if it reads SQLITE_PATH or similar:
+          SQLITE_PATH: data/test.db
+          # Keep Streamlit quiet if it gets imported:
+          STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+        run: |
+          pytest -q --cov=. --cov-report=term-missing
+          coverage-badge -o coverage.svg -f
+
+      - name: Upload coverage badge
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-badge
+          path: coverage.svg
