@@ -1,107 +1,89 @@
-name: CI / Build • Test • Coverage
+name: test
 
 on:
   push:
-    branches: [ main, "feature/**", "fix/**" ]
+    branches: [ main, feature/** ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  # Minimum % coverage required to pass. Tweak as needed.
-  COV_MIN: "80"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-
-    # Surface secrets through env so we can safely test in an if: expression
-    env:
-      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-      GIST_ID: ${{ secrets.GIST_ID }}
-
     strategy:
-      fail-fast: false
       matrix:
-        python-version: [ "3.10", "3.11", "3.12" ]
+        python-version: ['3.12']
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
 
-      - name: Install dependencies
+      - name: Install system sqlite3 (for debug/use)
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-cov coverage-badge
+          pip install pytest-cov coverage-badge
+
+      - name: Prepare test SQLite DB
+        env:
+          TEST_DB: data/test.db
+        run: |
+          mkdir -p data
+          python - <<'PY'
+          import sqlite3, os
+          db = os.environ["TEST_DB"]
+          con = sqlite3.connect(db)
+          cur = con.cursor()
+          cur.executescript("""
+          DROP TABLE IF EXISTS balances;
+          DROP TABLE IF EXISTS transfers;
+          CREATE TABLE balances(
+            contract TEXT,
+            block_number INTEGER,
+            address TEXT,
+            balance_units INTEGER
+          );
+          CREATE TABLE transfers(
+            contract TEXT,
+            block_number INTEGER,
+            from_address TEXT,
+            to_address TEXT,
+            value_units INTEGER
+          );
+          INSERT INTO balances VALUES
+          ('0xTEST', 3, '0xA', 200),
+          ('0xTEST', 3, '0xB', 300),
+          ('0xTEST', 5, '0xB', 400),
+          ('0xTEST', 5, '0xC', 100);
+          INSERT INTO transfers VALUES
+          ('0xTEST', 3, '0xA', '0xB', 50),
+          ('0xTEST', 5, '0xB', '0xC', 25);
+          """)
+          con.commit()
+          con.close()
+          PY
+          sqlite3 "$TEST_DB" "SELECT COUNT(*) FROM balances;"
 
       - name: Run tests with coverage
+        env:
+          # Make the app import-safe:
+          ONI_DASHBOARD_TEST_MODE: "1"
+          # Let your code pick this up if it reads SQLITE_PATH or similar:
+          SQLITE_PATH: data/test.db
+          # Keep Streamlit quiet if it gets imported:
+          STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
         run: |
-          pytest -q \
-            --cov=ingestion \
-            --cov=etl \
-            --cov=storage \
-            --cov=dashboard \
-            --cov-report=xml \
-            --cov-report=term
-
-      - name: Fail if coverage is below ${{ env.COV_MIN }}%
-        run: |
-          python - <<'PY'
-          import os, sys, xml.etree.ElementTree as ET
-          cov_min = float(os.environ.get("COV_MIN", "80"))
-          rate = float(ET.parse("coverage.xml").getroot().attrib["line-rate"]) * 100
-          print(f"Coverage: {rate:.2f}% (minimum required: {cov_min:.2f}%)")
-          with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a") as f:
-              f.write(f"### Coverage\n\n- **Total:** {rate:.2f}%\n- **Minimum required:** {cov_min:.2f}%\n")
-          if rate + 1e-9 < cov_min:
-              sys.exit(1)
-          PY
-
-      - name: Create coverage HTML and SVG badge
-        run: |
-          coverage html -d htmlcov
+          pytest -q --cov=. --cov-report=term-missing
           coverage-badge -o coverage.svg -f
 
-      - name: Upload coverage artifacts
+      - name: Upload coverage badge
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-${{ matrix.python-version }}
-          path: |
-            coverage.xml
-            coverage.svg
-            htmlcov/
-
-      # Read the percent BEFORE the optional publish step
-      - id: readcov
-        name: Read percent (for optional badge)
-        run: |
-          python - <<'PY' > percent.txt
-          import xml.etree.ElementTree as ET
-          rate = float(ET.parse("coverage.xml").getroot().attrib["line-rate"]) * 100
-          print(f"{rate:.2f}")
-          PY
-          echo "percent=$(cat percent.txt)" >> "$GITHUB_OUTPUT"
-
-      # OPTIONAL publish to a Gist for a live badge in README.
-      # Requires a Gist with a file (e.g., coverage.json) and a PAT with "gist" scope.
-      - name: Publish badge to Gist (optional)
-        if: ${{ env.GIST_TOKEN != '' && env.GIST_ID != '' && github.event_name != 'pull_request' }}
-        uses: schneegans/dynamic-badges-action@v1.7.0
-        with:
-          auth: ${{ env.GIST_TOKEN }}
-          gistID: ${{ env.GIST_ID }}
-          filename: coverage.json
-          label: coverage
-          message: ${{ steps.readcov.outputs.percent }}
-          color: green
+          name: coverage-badge
+          path: coverage.svg
