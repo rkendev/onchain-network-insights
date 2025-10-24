@@ -33,6 +33,7 @@ jobs:
       - name: Prepare test SQLite DB
         env:
           TEST_DB: data/test.db
+          ONI_OFFLINE: "1"
         run: |
           mkdir -p data
           python - <<'PY'

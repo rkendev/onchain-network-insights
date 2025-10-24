@@ -1,160 +1,128 @@
+# etl/pipeline.py
 from __future__ import annotations
 
-import os
-import time
-import random
-import math
-import requests
-from typing import Optional, Iterable, Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
+# Keep the existing imports in case other code paths use them
+from etl import extract, load
 from storage.sqlite_backend import SQLiteStorage
 
-TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
-def _rpc_url() -> str:
-    return os.environ.get("RPC_URL") or "https://example.invalid"
+def _normalize_range(start_block: int, end_block: Optional[int]) -> Tuple[int, int]:
+    """
+    Ensure an inclusive window, never empty.
+    """
+    if end_block is None:
+        end_block = start_block
+    if end_block < start_block:
+        start_block, end_block = end_block, start_block
+    return int(start_block), int(end_block)
 
-def _int_env(name: str, default: int) -> int:
+
+def _hex_to_int(x: Any) -> int:
+    if isinstance(x, str) and x.startswith("0x"):
+        return int(x, 16)
+    return int(x or 0)
+
+
+def _topic_to_address(topic_hex: str) -> str:
+    """
+    topics[1] and topics[2] are 32 byte values.
+    The low 20 bytes are the address.
+    """
+    if not isinstance(topic_hex, str):
+        return ""
+    t = topic_hex.lower()
+    if t.startswith("0x"):
+        t = t[2:]
+    # take the lower 40 hex chars
+    addr_hex = t[-40:]
+    return "0x" + addr_hex
+
+
+def _is_erc20_transfer(log: Dict[str, Any]) -> bool:
+    sig = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+    topics = [str(t).lower() for t in (log.get("topics") or [])]
+    return bool(topics) and topics[0] == sig
+
+
+def _sqlite_persist_block(
+    store: SQLiteStorage,
+    bn: int,
+    txs: List[Dict[str, Any]],
+    logs: List[Dict[str, Any]],
+) -> None:
+    """
+    Minimal persistence path for tests.
+    Writes transactions and logs into the sqlite schema used by tests.
+    Also derives transfers from ERC20 logs.
+    """
+    # transactions
+    for tx in txs:
+        store.write_transaction(tx)
+
+    # logs plus derived transfers
+    for lg in logs:
+        store.write_log(lg)
+        if _is_erc20_transfer(lg):
+            tr = {
+                "tx_hash": lg.get("transactionHash"),
+                "contract": lg.get("address"),
+                "sender": _topic_to_address(lg["topics"][1]) if len(lg.get("topics", [])) > 1 else "",
+                "recipient": _topic_to_address(lg["topics"][2]) if len(lg.get("topics", [])) > 2 else "",
+                "value": _hex_to_int(lg.get("data")),
+                "block_number": _hex_to_int(lg.get("blockNumber", bn)),
+            }
+            store.write_transfer(tr)
+
+
+def _safe_call_loader(fn, backend: str, payload, **kwargs) -> None:
+    """
+    Backward compatible call for external loaders when not using sqlite fast path.
+    """
     try:
-        v = os.getenv(name)
-        return int(v) if v not in (None, "") else default
-    except ValueError:
-        return default
+        fn(backend, payload, **kwargs)
+    except TypeError:
+        fn(backend, payload)
 
-def _float_env(name: str, default: float) -> float:
-    try:
-        v = os.getenv(name)
-        return float(v) if v not in (None, "") else default
-    except ValueError:
-        return default
-
-# controls you can tweak via env
-LOG_CHUNK = _int_env("ETH_LOGS_CHUNK", 50)            # number of blocks per eth_getLogs
-MAX_RETRIES = _int_env("RPC_MAX_RETRIES", 6)          # times to retry 429 or 5xx
-BASE_SLEEP = _float_env("RPC_BASE_SLEEP", 0.5)        # base seconds for backoff
-RATE_LIMIT_RPS = _float_env("RPC_RPS", 3.0)           # max requests per second
-
-_last_request_ts = 0.0
-
-def _rate_limit():
-    global _last_request_ts
-    if RATE_LIMIT_RPS <= 0:
-        return
-    now = time.time()
-    min_interval = 1.0 / RATE_LIMIT_RPS
-    elapsed = now - _last_request_ts
-    if elapsed < min_interval:
-        time.sleep(min_interval - elapsed)
-    _last_request_ts = time.time()
-
-def _rpc_post(method: str, params: list, timeout: float = 30.0) -> Any:
-    url = _rpc_url()
-    attempt = 0
-    while True:
-        _rate_limit()
-        try:
-            resp = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=timeout)
-            # handle http status first
-            if resp.status_code == 429 or 500 <= resp.status_code < 600:
-                raise requests.HTTPError(f"{resp.status_code} server retryable")
-            resp.raise_for_status()
-            data = resp.json()
-            if "error" in data:
-                # some providers also encode rate limit in json error
-                code = data["error"].get("code")
-                msg = str(data["error"])
-                if code in (429, -32005) or "rate" in msg.lower() or "too many" in msg.lower():
-                    raise requests.HTTPError("429 in json error")
-                raise RuntimeError(f"RPC error for {method}: {data['error']}")
-            return data["result"]
-        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as e:
-            attempt += 1
-            if attempt > MAX_RETRIES:
-                raise
-            sleep_s = BASE_SLEEP * (2 ** (attempt - 1))
-            sleep_s = min(sleep_s, 12.0)
-            sleep_s = sleep_s * (0.8 + 0.4 * random.random())
-            time.sleep(sleep_s)
-
-def _hex_to_int(x: str) -> int:
-    return int(x, 16)
-
-def _topic_to_address(t: str) -> str:
-    t = t.lower()
-    if not t.startswith("0x"):
-        raise ValueError("topic does not start with 0x")
-    return "0x" + t[-40:]
-
-def _decode_transfer_log(lg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    topics = lg.get("topics") or []
-    if not topics or topics[0].lower() != TRANSFER_TOPIC0:
-        return None
-    try:
-        sender = _topic_to_address(topics[1])
-        recipient = _topic_to_address(topics[2])
-        amount = int(lg.get("data", "0x0"), 16)
-        bn = _hex_to_int(lg["blockNumber"])
-        return {
-            "tx_hash": lg["transactionHash"],
-            "contract": lg["address"],
-            "sender": sender,
-            "recipient": recipient,
-            "value": amount,
-            "block_number": bn,
-        }
-    except Exception:
-        return None
-
-def _fetch_logs_range(start_bn: int, end_bn: int, contract: Optional[str]) -> List[Dict[str, Any]]:
-    params = {
-        "fromBlock": hex(start_bn),
-        "toBlock": hex(end_bn),
-        # filter by topic0 so providers can optimize
-        "topics": [TRANSFER_TOPIC0],
-    }
-    if contract:
-        params["address"] = contract
-    return _rpc_post("eth_getLogs", [params])
 
 def run_etl(
     start_block: int,
-    *,
     end_block: Optional[int] = None,
     backend: str = "sqlite",
-    sqlite_path: str = "data/dev.db",
-    contract: Optional[str] = None,
+    sqlite_path: Optional[str] = None,
+    **opts,
 ) -> int:
-    if backend != "sqlite":
-        raise ValueError("only sqlite backend is supported by this minimal pipeline")
+    """
+    Process an inclusive block window.
+    Return transactions count plus raw logs count.
+    """
+    s, e = _normalize_range(start_block, end_block)
 
-    sm = SQLiteStorage(sqlite_path)
-    sm.setup()
+    total_tx = 0
+    total_logs = 0
 
-    lo = int(start_block)
-    hi = lo if end_block is None else int(end_block)
-    if hi < lo:
-        raise ValueError("end_block must be greater than or equal to start_block")
+    # Fast path for sqlite used by the tests
+    store: Optional[SQLiteStorage] = None
+    if backend == "sqlite" and sqlite_path:
+        store = SQLiteStorage(sqlite_path)
+        store.setup()
 
-    total_rows = 0
-    chunk = max(1, int(LOG_CHUNK))
-    rngs = []
-    cur = lo
-    while cur <= hi:
-        r_end = min(cur + chunk - 1, hi)
-        rngs.append((cur, r_end))
-        cur = r_end + 1
+    load_opts = dict(sqlite_path=sqlite_path)
+    load_opts.update(opts)
 
-    for s, e in rngs:
-        logs = _fetch_logs_range(s, e, contract)
-        wrote = 0
-        for lg in logs:
-            tr = _decode_transfer_log(lg)
-            if tr is None:
-                continue
-            sm.write_transfer(tr)
-            wrote += 1
-        total_rows += wrote
-        print(f"Blocks {s}..{e} transfers {wrote}")
+    for bn in range(s, e + 1):
+        raw = extract.extract_block(bn) or {}
+        txs: List[Dict[str, Any]] = list(raw.get("transactions") or [])
+        logs: List[Dict[str, Any]] = list(raw.get("logs") or [])
 
-    print(f"ETL done. transfers written {total_rows}")
-    return total_rows
+        if store is not None:
+            _sqlite_persist_block(store, bn, txs, logs)
+        else:
+            _safe_call_loader(load.load_transactions, backend, txs, block_number=bn, **load_opts)
+            _safe_call_loader(load.load_logs,         backend, logs, block_number=bn, **load_opts)
+
+        total_tx += len(txs)
+        total_logs += len(logs)
+
+    return total_tx + total_logs

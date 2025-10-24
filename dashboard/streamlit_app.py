@@ -9,7 +9,7 @@ import zipfile
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, Sequence
 
 import numpy as np
 import pandas as pd
@@ -17,8 +17,44 @@ import streamlit as st
 
 
 # ============================================================
-# pure helpers and light db utilities only below this line
-# nothing here should touch the db by default at import time
+# pure helpers that tests can import safely
+# ============================================================
+
+def gini_coefficient(values: Sequence[float] | np.ndarray) -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    arr = arr[arr > 0]
+    if arr.size == 0:
+        return 0.0
+    arr.sort()
+    n = arr.size
+    cum = np.cumsum(arr)
+    g = (n + 1 - 2 * np.sum(cum) / cum[-1]) / n
+    g = float(max(0.0, min(1.0, g)))
+    return g
+
+
+def concentration_ratios(values: Sequence[float] | np.ndarray, ks=(1, 2, 3, 5, 10)) -> pd.DataFrame:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    arr = arr[arr > 0]
+    if arr.size == 0:
+        return pd.DataFrame({"k": list(ks), "ratio": [0.0] * len(ks), "ratio_pct": [0.0] * len(ks)})
+    arr.sort()
+    arr = arr[::-1]
+    total = float(arr.sum())
+    out = []
+    for k in ks:
+        k = int(max(0, k))
+        k = min(k, arr.size)
+        top = float(arr[:k].sum()) if k > 0 else 0.0
+        r = (top / total) if total > 0 else 0.0
+        out.append({"k": k, "ratio": r, "ratio_pct": round(100.0 * r, 2)})
+    return pd.DataFrame(out)
+
+
+# ============================================================
+# light db utilities
 # ============================================================
 
 @dataclass
@@ -110,12 +146,11 @@ def total_supply(con, contract: str, as_of: int) -> float:
 
 
 def transfers_count(con, contract: str) -> int:
-    sql = "SELECT COUNT(*) AS c FROM transfers WHERE LOWER(contract)=LOWER(?);"
-    df = q(con, sql, (contract,))
+    df = q(con, "SELECT COUNT(*) AS c FROM transfers WHERE LOWER(contract)=LOWER(?)", (contract,))
     return int(df.iloc[0]["c"]) if not df.empty else 0
 
 
-def gini_from_balances(con, contract: str, as_of: int) -> float:
+def gini_from_balances_db(con, contract: str, as_of: int) -> float:
     sql = """
     SELECT MAX(balance_units) AS bal
     FROM balances
@@ -126,19 +161,10 @@ def gini_from_balances(con, contract: str, as_of: int) -> float:
     ORDER BY bal ASC;
     """
     df = q(con, sql, (contract, as_of))
-    if df.empty:
-        return 0.0
-    x = df["bal"].to_numpy(dtype=float)
-    if x.size == 0:
-        return 0.0
-    x = np.sort(x)
-    n = x.size
-    cum = np.cumsum(x)
-    g = (n + 1 - 2 * np.sum(cum) / cum[-1]) / n if cum[-1] > 0 else 0.0
-    return float(max(0.0, min(1.0, g)))
+    return gini_coefficient(df["bal"].to_numpy(dtype=float)) if not df.empty else 0.0
 
 
-def concentration_ratios(con, contract: str, as_of: int, ks=(1, 2, 3, 5, 10)) -> pd.DataFrame:
+def concentration_ratios_db(con, contract: str, as_of: int, ks=(1, 2, 3, 5, 10)) -> pd.DataFrame:
     sql = """
     SELECT MAX(balance_units) AS bal
     FROM balances
@@ -149,17 +175,7 @@ def concentration_ratios(con, contract: str, as_of: int, ks=(1, 2, 3, 5, 10)) ->
     ORDER BY bal DESC;
     """
     df = q(con, sql, (contract, as_of))
-    if df.empty:
-        return pd.DataFrame({"k": ks, "ratio": [0]*len(ks), "ratio_pct": [0]*len(ks)})
-    balances = df["bal"].to_numpy(dtype=float)
-    total = balances.sum()
-    out = []
-    for k in ks:
-        k = min(k, balances.size)
-        top_sum = balances[:k].sum() if k > 0 else 0.0
-        ratio = (top_sum / total) if total > 0 else 0.0
-        out.append((k, ratio, 100.0 * ratio))
-    return pd.DataFrame(out, columns=["k", "ratio", "ratio_pct"])
+    return concentration_ratios(df["bal"].to_numpy(dtype=float), ks=ks) if not df.empty else pd.DataFrame({"k": ks, "ratio": [0.0]*len(ks), "ratio_pct": [0.0]*len(ks)})
 
 
 def top_holders(con, contract: str, as_of: int, n: int) -> pd.DataFrame:
@@ -249,9 +265,7 @@ def _block_bounds(con, contract: str) -> Tuple[int, int]:
 
 
 # ============================================================
-# everything below runs only when render_app is called
-# streamlit will call this in the container
-# pytest in ci sets ONI_DASHBOARD_TEST_MODE=1 which skips execution
+# app rendering runs only when called
 # ============================================================
 
 def render_app() -> None:
@@ -283,7 +297,6 @@ def render_app() -> None:
             st.info("Select or paste an ERC 20 contract to continue.")
             st.stop()
 
-        # read bounds to guide user
         with closing(connect(cfg)) as con:
             lo_bn, hi_bn = _block_bounds(con, contract)
 
@@ -304,11 +317,10 @@ def render_app() -> None:
         topn = st.slider("Top N tables", min_value=5, max_value=100, value=10)
         whale_threshold = st.number_input("Whale threshold units", min_value=0.0, value=1000.0, step=1.0)
 
-    # metrics
     with closing(connect(cfg)) as con:
         symbol, decimals = read_metadata(con, contract)
-        # clamp as of into available range if user entered an out of range number
         latest = pick_latest_block(con, contract)
+
         effective_as_of = as_of_block
         if effective_as_of > 0:
             if latest > 0 and effective_as_of > latest:
@@ -317,14 +329,14 @@ def render_app() -> None:
             if lo_bn > 0 and effective_as_of < lo_bn:
                 st.warning(f"As of block {effective_as_of} is below DB minimum {lo_bn}. Using {lo_bn}.")
                 effective_as_of = lo_bn
-
         effective_as_of = 0 if as_of_block == 0 else effective_as_of
 
-        holders = holders_count(con, contract, latest if effective_as_of == 0 else effective_as_of)
-        total = total_supply(con, contract, latest if effective_as_of == 0 else effective_as_of)
-        gini = gini_from_balances(con, contract, latest if effective_as_of == 0 else effective_as_of)
+        query_asof = latest if effective_as_of == 0 else effective_as_of
+        holders = holders_count(con, contract, query_asof)
+        total = total_supply(con, contract, query_asof)
+        gini_db = gini_from_balances_db(con, contract, query_asof)
         xfers = transfers_count(con, contract)
-        cr_df = concentration_ratios(con, contract, latest if effective_as_of == 0 else effective_as_of, ks=(1, 2, 3, 5, 10))
+        cr_df = concentration_ratios_db(con, contract, query_asof, ks=(1, 2, 3, 5, 10))
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Symbol", symbol)
@@ -336,15 +348,13 @@ def render_app() -> None:
 
     st.metric("Holders", holders)
     st.metric(f"Total supply as of [{symbol}]", f"{total:,.4f}")
-    st.metric("Gini", f"{gini:.4f}")
+    st.metric("Gini", f"{gini_db:.4f}")
 
-    # latest badge
     if hi_bn:
         st.markdown(_latest_badge_html(0 if effective_as_of == 0 else int(effective_as_of), hi_bn), unsafe_allow_html=True)
 
-    # top holders
     with closing(connect(cfg)) as con:
-        top_df = top_holders(con, contract, latest if effective_as_of == 0 else effective_as_of, topn)
+        top_df = top_holders(con, contract, query_asof, topn)
     st.subheader("Top Holders")
     if top_df.empty:
         st.info("No holders at the selected as of block.")
@@ -352,9 +362,8 @@ def render_app() -> None:
         st.bar_chart(top_df.set_index("address_short")["balance_units"])
         st.dataframe(top_df[["address", "balance_units"]], use_container_width=True)
 
-    # whales
     with closing(connect(cfg)) as con:
-        whales_df = whales(con, contract, latest if effective_as_of == 0 else effective_as_of, whale_threshold, topn)
+        whales_df = whales(con, contract, query_asof, whale_threshold, topn)
     st.subheader(f"Whales ≥ {int(whale_threshold)}")
     if whales_df.empty:
         st.info("No whales at the selected threshold and as of block.")
@@ -364,12 +373,10 @@ def render_app() -> None:
         c1t.dataframe(whales_df[["address", "balance_units"]], use_container_width=True)
         c2t.dataframe(whales_df[["address", "balance_units"]], use_container_width=True)
 
-    # concentration ratios
     st.subheader("Concentration Ratios")
     st.line_chart(cr_df.set_index("k")["ratio"])
     st.dataframe(cr_df.assign(ratio_pct=cr_df["ratio_pct"].round(2)), use_container_width=True)
 
-    # deltas
     with closing(connect(cfg)) as con:
         deltas_df = holder_deltas(con, contract, int(start_block_excl), int(end_block_incl))
     st.subheader("Holder Deltas")
@@ -380,30 +387,23 @@ def render_app() -> None:
     else:
         st.dataframe(deltas_df, use_container_width=True)
 
-    # snapshot zip
     st.divider()
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         now = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         prefix = f"oni_snapshot_{symbol or 'token'}_{now}"
-        for name, df in [
+        for name, df_out in [
             ("top_holders.csv", top_df),
             ("whales.csv", whales_df),
             ("concentration_ratios.csv", cr_df),
             ("holder_deltas.csv", deltas_df),
         ]:
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                z.writestr(f"{prefix}/{name}", df.to_csv(index=False))
+            if isinstance(df_out, pd.DataFrame) and not df_out.empty:
+                z.writestr(f"{prefix}/{name}", df_out.to_csv(index=False))
     st.download_button("Download snapshot zip", data=buf.getvalue(), file_name="snapshot.zip", mime="application/zip")
 
 
-# ============================================================
 # import safety for tests and ci
-# set ONI_DASHBOARD_TEST_MODE=1 in ci so imports never execute the app
-# streamlit runtime will execute render_app when serving locally or in the container
-# ============================================================
-
-if os.getenv("ONI_DASHBOARD_TEST_MODE") != "1":
-    # when running streamlit the file is executed as a script
-    # this call makes the ui appear while remaining safe for pytest imports in ci
-    render_app()
+if __name__ == "__main__":
+    if os.getenv("ONI_DASHBOARD_TEST_MODE") != "1":
+        render_app()
