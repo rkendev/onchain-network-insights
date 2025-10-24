@@ -1,0 +1,44 @@
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: onchain-network-insights:latest
+    container_name: oni-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data:rw
+      # development hot reload
+      # - ./:/app
+    environment:
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_SERVER_ENABLECORS: "false"
+      STREAMLIT_SERVER_ENABLEXSRSFPROTECTION: "true"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: onchain-network-insights:latest
+    container_name: oni-ingest
+    command: ["python", "-m", "scripts.ingest_cli"]
+    depends_on:
+      - dashboard
+    environment:
+      RPC_URL: ${RPC_URL}
+      ETHERSCAN_API_KEY: ${ETHERSCAN_API_KEY}
+      CONTRACT: ${CONTRACT}
+      START_BLOCK: ${START_BLOCK}
+      END_BLOCK: ${END_BLOCK}
+      SQLITE_PATH: ${SQLITE_PATH:-/app/data/dev.db}
+      PYTHONPATH: /app
+    volumes:
+      - ./data:/app/data:rw
+    profiles:
+      - tools

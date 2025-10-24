@@ -1,32 +1,104 @@
-name: CI / Python Build & Test
+name: CI / Build • Test • Coverage
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, "feature/**", "fix/**" ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Minimum % coverage required to pass. You can tweak per repo or per job via matrix.
+  COV_MIN: "80"
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: [ "3.10", "3.11", "3.12" ]
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v5
 
-      - name: Set up Python
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # If you have a dev/requirements-dev.txt, prefer that. Otherwise install here.
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest pytest-cov coverage-badge
 
-      - name: Run tests
-        run: pytest -q
+      - name: Run tests with coverage
+        run: |
+          pytest -q \
+            --cov=ingestion \
+            --cov=etl \
+            --cov=storage \
+            --cov=dashboard \
+            --cov-report=xml \
+            --cov-report=term
+
+      - name: Fail if coverage is below ${{ env.COV_MIN }}%
+        run: |
+          python - <<'PY'
+          import os, sys, xml.etree.ElementTree as ET
+          cov_min = float(os.environ.get("COV_MIN", "80"))
+          rate = float(ET.parse("coverage.xml").getroot().attrib["line-rate"]) * 100
+          print(f"Coverage: {rate:.2f}% (minimum required: {cov_min:.2f}%)")
+          # Write short summary for job logs
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a") as f:
+              f.write(f"### Coverage\n\n- **Total:** {rate:.2f}%\n- **Minimum required:** {cov_min:.2f}%\n")
+          if rate + 1e-9 < cov_min:
+              sys.exit(1)
+          PY
+
+      - name: Create coverage HTML and SVG badge
+        run: |
+          coverage html -d htmlcov
+          coverage-badge -o coverage.svg -f
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            coverage.svg
+            htmlcov/
+
+      # OPTIONAL: publish a live badge via a Gist for README usage.
+      # Create a secret named GIST_TOKEN with "gist" scope and a secret named GIST_ID
+      # that points to an existing Gist file (e.g., coverage.json) to host the badge data.
+      - name: Publish badge to Gist (optional)
+        if: ${{ secrets.GIST_TOKEN != '' && secrets.GIST_ID != '' }}
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        with:
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: ${{ secrets.GIST_ID }}
+          filename: coverage.json
+          label: coverage
+          message: ${{ steps.readcov.outputs.percent || 'n/a' }}
+          color: green
+
+      # Helper step to expose percent for the optional badge step above
+      - id: readcov
+        name: Read percent (for optional badge)
+        run: |
+          python - <<'PY' > percent.txt
+          import xml.etree.ElementTree as ET
+          rate = float(ET.parse("coverage.xml").getroot().attrib["line-rate"]) * 100
+          print(f"{rate:.2f}")
+          PY
+          echo "percent=$(cat percent.txt)" >> "$GITHUB_OUTPUT"

@@ -1,488 +1,372 @@
-# dashboard/streamlit_app.py
-from __future__ import annotations
-
+import io
+import os
 import sqlite3
+import zipfile
 from contextlib import closing
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Tuple
+from datetime import datetime
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ----------------------------
-# UI helpers
-# ----------------------------
 
-st.set_page_config(page_title="Onchain Network Insights — Dashboard", layout="wide")
+# ----------------------------
+# DB helpers
+# ----------------------------
 
 @dataclass
-class AppState:
-    db_path: str
-    contract: Optional[str]
-    as_of_block: Optional[int]
-    top_n: int
-    whale_threshold: int
-    delta_start: Optional[int]
-    delta_end: Optional[int]
+class DbCfg:
+    path: str
 
-ZERO = "0x0000000000000000000000000000000000000000"
 
-# ----------------------------
-# SQL bootstrap (idempotent)
-# ----------------------------
+def connect(cfg: DbCfg) -> sqlite3.Connection:
+    # row_factory gives dict-like rows for direct DataFrame creation
+    con = sqlite3.connect(cfg.path, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
 
-CREATE_TRANSFERS_ENRICHED = f"""
-CREATE VIEW IF NOT EXISTS transfers_enriched AS
-SELECT
-  t.tx_hash,
-  t.contract,
-  t."from" AS from_addr,
-  t."to"   AS to_addr,
-  t.value,
-  t.blockNumber,
-  CASE
-    WHEN t."from" = '{ZERO}' AND t."to" != '{ZERO}' THEN 'mint'
-    WHEN t."to"   = '{ZERO}' AND t."from" != '{ZERO}' THEN 'burn'
-    ELSE 'transfer'
-  END AS direction,
-  -- delta for 'to' address (positive when tokens are received)
-  CASE
-    WHEN t."from" = '{ZERO}' THEN t.value                      -- mint increases 'to'
-    WHEN t."to"   = '{ZERO}' THEN -t.value                     -- burn decreases 'from'
-    ELSE 0                                                     -- we handle from/to separately in balances_view
-  END AS base_delta
-FROM transfers t;
-"""
 
-# balances_view computes final balances using:
-#  + base_delta for mints/burns (applied to the appropriate holder)
-#  + +value for 'to' in transfers
-#  + -value for 'from' in transfers
-CREATE_BALANCES_VIEW = f"""
-CREATE VIEW IF NOT EXISTS balances_view AS
-WITH
-tx AS (
-  SELECT * FROM transfers_enriched
-),
--- deltas from regular transfers
-transfer_to AS (
-  SELECT contract, to_addr  AS address, value    AS delta, blockNumber
-  FROM tx WHERE direction = 'transfer'
-),
-transfer_from AS (
-  SELECT contract, from_addr AS address, -value  AS delta, blockNumber
-  FROM tx WHERE direction = 'transfer'
-),
--- mints/burns already encoded in base_delta on the correct side:
-mint_burn_to AS (
-  SELECT contract, to_addr   AS address, base_delta AS delta, blockNumber
-  FROM tx WHERE direction = 'mint'
-),
-mint_burn_from AS (
-  SELECT contract, from_addr AS address, base_delta AS delta, blockNumber
-  FROM tx WHERE direction = 'burn'
-),
-all_deltas AS (
-  SELECT * FROM transfer_to
-  UNION ALL
-  SELECT * FROM transfer_from
-  UNION ALL
-  SELECT * FROM mint_burn_to
-  UNION ALL
-  SELECT * FROM mint_burn_from
-)
-SELECT
-  contract,
-  address,
-  SUM(delta) AS balance,
-  MAX(blockNumber) AS last_block
-FROM all_deltas
-GROUP BY contract, address;
-"""
+def q(con: sqlite3.Connection, sql: str, params: tuple = ()) -> pd.DataFrame:
+    return pd.read_sql_query(sql, con, params=params)
 
-def ensure_views(con: sqlite3.Connection) -> None:
-    """Create the minimal analytics views if they are missing."""
-    # Fail fast if the core table is missing
-    cur = con.execute("""
-        SELECT name FROM sqlite_master
-        WHERE type IN ('table','view') AND name='transfers';
-    """)
-    row = cur.fetchone()
-    if not row:
-        raise RuntimeError(
-            "Database is missing the 'transfers' table. "
-            "Seed the DB first or run your ETL."
-        )
-    con.executescript(CREATE_TRANSFERS_ENRICHED)
-    con.executescript(CREATE_BALANCES_VIEW)
 
 # ----------------------------
-# Metadata helpers
+# Data queries
 # ----------------------------
 
-def read_metadata(con: sqlite3.Connection, contract: str) -> dict:
-    """Read optional ERC-20 metadata (decimals, symbol) if present."""
-    meta = {"symbol": "", "decimals": 0}
+def list_contracts(con) -> pd.DataFrame:
+    # contracts present in balances/transfers
+    sql = """
+    WITH c AS (
+      SELECT DISTINCT contract FROM balances
+      UNION
+      SELECT DISTINCT contract FROM transfers
+    )
+    SELECT c.contract
+    FROM c
+    ORDER BY c.contract;
+    """
     try:
-        row = con.execute(
-            "SELECT symbol, decimals FROM erc20_metadata WHERE contract = ? LIMIT 1",
-            (contract,),
-        ).fetchone()
-        if row:
-            meta["symbol"] = row[0] or ""
-            meta["decimals"] = int(row[1] or 0)
-    except sqlite3.OperationalError:
-        # metadata table may not exist in a demo DB
-        pass
-    return meta
+        return q(con, sql)
+    except Exception:
+        return pd.DataFrame(columns=["contract"])
 
-# ----------------------------
-# Analytics
-# ----------------------------
 
-def holder_balances(
-    con: sqlite3.Connection,
-    contract: str,
-    as_of: Optional[int],
-    top_n: int,
-) -> Tuple[pd.DataFrame, dict]:
+def read_metadata(con, contract: str) -> tuple[str, int]:
+    sql = """
+    SELECT symbol, COALESCE(decimals, 0) AS decimals
+    FROM erc20_metadata
+    WHERE LOWER(contract) = LOWER(?)
+    LIMIT 1;
     """
-    Return (top_holders_dataframe, metadata_dict).
-    Uses balances_view; optionally filters by as-of block.
-    """
-    ensure_views(con)
-    where = ["contract = ?"]
-    params = [contract]
-    if as_of is not None and as_of > 0:
-        where.append("last_block <= ?")
-        params.append(as_of)
-    sql = f"""
-        SELECT address, balance
-        FROM balances_view
-        WHERE {' AND '.join(where)}
-        ORDER BY balance DESC
-        LIMIT ?
-    """
-    params.append(top_n)
-    rows = con.execute(sql, tuple(params)).fetchall()
-    df = pd.DataFrame(rows, columns=["address", "balance"])
-    meta = read_metadata(con, contract)
-    return df, meta
+    df = q(con, sql, (contract,))
+    if df.empty:
+        return "N A", 0
+    row = df.iloc[0]
+    sym = row["symbol"] if isinstance(row["symbol"], str) and row["symbol"].strip() else "N A"
+    return sym, int(row["decimals"])
 
-def whales(
-    con: sqlite3.Connection,
-    contract: str,
-    threshold: int,
-    as_of: Optional[int],
-    top_n: int,
-) -> pd.DataFrame:
-    ensure_views(con)
-    where = ["contract = ?", "balance >= ?"]
-    params = [contract, threshold]
-    if as_of is not None and as_of > 0:
-        where.append("last_block <= ?")
-        params.append(as_of)
-    sql = f"""
-        SELECT address, balance
-        FROM balances_view
-        WHERE {' AND '.join(where)}
-        ORDER BY balance DESC
-        LIMIT ?
-    """
-    params.append(top_n)
-    rows = con.execute(sql, tuple(params)).fetchall()
-    return pd.DataFrame(rows, columns=["address", "balance"])
 
-def concentration_ratios(
-    con: sqlite3.Connection,
-    contract: str,
-    as_of: Optional[int],
-    ks=(1, 2, 3, 5, 10, 50, 100),
-) -> pd.DataFrame:
-    """CR_k over top-k holders: sum(top k)/sum(all)."""
-    ensure_views(con)
-    # total supply proxy = sum balances (within as-of)
-    total_where = ["contract = ?"]
-    total_params = [contract]
-    if as_of is not None and as_of > 0:
-        total_where.append("last_block <= ?")
-        total_params.append(as_of)
-    total_sql = f"""
-        SELECT COALESCE(SUM(balance),0)
-        FROM balances_view
-        WHERE {' AND '.join(total_where)}
+def pick_as_of_block(con, contract: str, default_zero: bool = True) -> int:
+    # latest block where we have any balance for the contract
+    sql = """
+    SELECT MAX(block_number) AS last_block
+    FROM balances
+    WHERE LOWER(contract) = LOWER(?);
     """
-    total = con.execute(total_sql, tuple(total_params)).fetchone()[0] or 0
-    data = []
+    df = q(con, sql, (contract,))
+    last_block = int(df.iloc[0]["last_block"]) if not df.empty and df.iloc[0]["last_block"] is not None else 0
+    return 0 if default_zero else last_block
+
+
+def holders_count(con, contract: str, as_of: int) -> int:
+    sql = """
+    SELECT COUNT(*) AS holders
+    FROM (
+        SELECT address
+        FROM balances
+        WHERE LOWER(contract) = LOWER(?)
+          AND block_number <= ?
+        GROUP BY address
+        HAVING MAX(balance_units) > 0
+    ) t;
+    """
+    df = q(con, sql, (contract, as_of))
+    return int(df.iloc[0]["holders"]) if not df.empty else 0
+
+
+def total_supply(con, contract: str, as_of: int, decimals: int) -> float:
+    # Sum balance_units (already scaled to base units in your ETL)
+    sql = """
+    SELECT SUM(balance_units) AS total_units
+    FROM (
+        SELECT address, MAX(balance_units) AS balance_units
+        FROM balances
+        WHERE LOWER(contract) = LOWER(?)
+          AND block_number <= ?
+        GROUP BY address
+    );
+    """
+    df = q(con, sql, (contract, as_of))
+    total_units = float(df.iloc[0]["total_units"]) if not df.empty and df.iloc[0]["total_units"] is not None else 0.0
+    # If balances are already in human units, decimals==0 will leave unchanged
+    scale = 10 ** 0  # your ETL already writes balance_units as human units
+    return total_units / scale
+
+
+def transfers_count(con, contract: str) -> int:
+    sql = """
+    SELECT COUNT(*) AS c FROM transfers
+    WHERE LOWER(contract) = LOWER(?);
+    """
+    df = q(con, sql, (contract,))
+    return int(df.iloc[0]["c"]) if not df.empty else 0
+
+
+def gini_coefficient(con, contract: str, as_of: int) -> float:
+    sql = """
+    SELECT MAX(balance_units) AS bal
+    FROM balances
+    WHERE LOWER(contract) = LOWER(?)
+      AND block_number <= ?
+    GROUP BY address
+    HAVING MAX(balance_units) > 0
+    ORDER BY bal ASC;
+    """
+    df = q(con, sql, (contract, as_of))
+    if df.empty:
+        return 0.0
+    x = df["bal"].to_numpy(dtype=float)
+    if x.size == 0:
+        return 0.0
+    # standard Gini on non-negative vector
+    x = np.sort(x)
+    n = x.size
+    cum = np.cumsum(x)
+    g = (n + 1 - 2 * np.sum(cum) / cum[-1]) / n if cum[-1] > 0 else 0.0
+    return float(max(0.0, min(1.0, g)))
+
+
+def concentration_ratios(con, contract: str, as_of: int, ks=(1, 2, 3, 5, 10)) -> pd.DataFrame:
+    sql = """
+    SELECT MAX(balance_units) AS bal
+    FROM balances
+    WHERE LOWER(contract) = LOWER(?)
+      AND block_number <= ?
+    GROUP BY address
+    HAVING MAX(balance_units) > 0
+    ORDER BY bal DESC;
+    """
+    df = q(con, sql, (contract, as_of))
+    if df.empty:
+        return pd.DataFrame({"k": ks, "ratio": [0]*len(ks), "ratio_pct": [0]*len(ks)})
+    balances = df["bal"].to_numpy(dtype=float)
+    total = balances.sum()
+    out = []
     for k in ks:
-        top_sql = f"""
-            SELECT COALESCE(SUM(balance),0)
-            FROM (
-              SELECT balance
-              FROM balances_view
-              WHERE {' AND '.join(total_where)}
-              ORDER BY balance DESC
-              LIMIT {k}
-            )
-        """
-        top_val = con.execute(top_sql, tuple(total_params)).fetchone()[0] or 0
-        ratio = (top_val / total) if total else 0.0
-        data.append({"k": k, "ratio": ratio, "ratio_pct": round(100 * ratio, 2)})
-    return pd.DataFrame(data)
+        k = min(k, balances.size)
+        top_sum = balances[:k].sum() if k > 0 else 0.0
+        ratio = (top_sum / total) if total > 0 else 0.0
+        out.append((k, ratio, 100.0 * ratio))
+    return pd.DataFrame(out, columns=["k", "ratio", "ratio_pct"])
+
+
+def top_holders(con, contract: str, as_of: int, n: int) -> pd.DataFrame:
+    sql = """
+    SELECT address, MAX(balance_units) AS balance_units
+    FROM balances
+    WHERE LOWER(contract) = LOWER(?)
+      AND block_number <= ?
+    GROUP BY address
+    HAVING MAX(balance_units) > 0
+    ORDER BY balance_units DESC
+    LIMIT ?;
+    """
+    df = q(con, sql, (contract, as_of, n))
+    if df.empty:
+        return df
+    df["address_short"] = df["address"].str.slice(0, 8) + "…"
+    return df
+
+
+def whales(con, contract: str, as_of: int, threshold_units: float, n: int) -> pd.DataFrame:
+    sql = """
+    SELECT address, MAX(balance_units) AS balance_units
+    FROM balances
+    WHERE LOWER(contract) = LOWER(?)
+      AND block_number <= ?
+    GROUP BY address
+    HAVING MAX(balance_units) >= ?
+    ORDER BY balance_units DESC
+    LIMIT ?;
+    """
+    df = q(con, sql, (contract, as_of, threshold_units, n))
+    if df.empty:
+        return df
+    df["address_short"] = df["address"].str.slice(0, 8) + "…"
+    return df
+
+
+def holder_deltas(con, contract: str, start_excl: int, end_incl: int) -> pd.DataFrame:
+    if start_excl >= end_incl:
+        return pd.DataFrame(columns=["address", "transfer_in", "transfer_out", "mint_in", "burn_out"])
+
+    sql = """
+    WITH tx AS (
+      SELECT
+        block_number,
+        LOWER(contract) AS contract,
+        LOWER(src)  AS src,
+        LOWER(dst)  AS dst,
+        amount_units AS amt
+      FROM transfers
+      WHERE LOWER(contract) = LOWER(?)
+        AND block_number > ?
+        AND block_number <= ?
+    )
+    SELECT
+      a.address,
+      SUM(a.transfer_in)  AS transfer_in,
+      SUM(a.transfer_out) AS transfer_out,
+      SUM(a.mint_in)      AS mint_in,
+      SUM(a.burn_out)     AS burn_out
+    FROM (
+      SELECT dst AS address, SUM(amt) AS transfer_in, 0 AS transfer_out, 0 AS mint_in, 0 AS burn_out FROM tx WHERE src != '0x0000000000000000000000000000000000000000' GROUP BY dst
+      UNION ALL
+      SELECT src AS address, 0, SUM(amt), 0, 0 FROM tx WHERE dst != '0x0000000000000000000000000000000000000000' GROUP BY src
+      UNION ALL
+      SELECT dst AS address, 0, 0, SUM(amt), 0 FROM tx WHERE src = '0x0000000000000000000000000000000000000000' GROUP BY dst
+      UNION ALL
+      SELECT src AS address, 0, 0, 0, SUM(amt) FROM tx WHERE dst = '0x0000000000000000000000000000000000000000' GROUP BY src
+    ) a
+    GROUP BY a.address
+    ORDER BY (COALESCE(SUM(a.transfer_in),0) + COALESCE(SUM(a.mint_in),0) - COALESCE(SUM(a.transfer_out),0) - COALESCE(SUM(a.burn_out),0)) DESC;
+    """
+    return q(con, sql, (contract, start_excl, end_incl))
+
 
 # ----------------------------
 # UI
 # ----------------------------
 
-def sidebar() -> AppState:
-    st.sidebar.header("Settings")
+st.set_page_config(page_title="Onchain Network Insights", layout="wide")
+st.title("Onchain Network Insights Dashboard")
+st.caption("Local analytics over your ingested ERC-20 data")
 
-    db_path = st.sidebar.text_input("SQLite DB path", "data/dev.db")
-    contract_in = st.sidebar.text_input("ERC-20 contract", "")
+with st.sidebar:
+    st.header("Settings")
 
-    # Also offer a dropdown of contracts found in DB (if any)
-    dropdown_val = ""
+    db_path = st.text_input("SQLite DB path", os.environ.get("SQLITE_PATH", "data/dev.db"))
+    cfg = DbCfg(db_path)
+
     try:
-        with closing(sqlite3.connect(db_path)) as con:
-            con.row_factory = None
-            cur = con.execute("""
-                SELECT DISTINCT contract
-                FROM transfers
-                ORDER BY contract
-                LIMIT 200
-            """)
-            choices = [r[0] for r in cur.fetchall()]
-        if choices:
-            dropdown_val = st.sidebar.selectbox("Pick a contract found in DB", choices, index=0)
-    except Exception:
-        pass
+        with closing(connect(cfg)) as con:
+            contracts = list_contracts(con)
+    except Exception as e:
+        st.error(f"Could not open DB at {db_path}: {e}")
+        st.stop()
 
-    # priority: free-text > dropdown > None
-    contract = (contract_in or dropdown_val or "").strip() or None
-
-    as_of = st.sidebar.number_input("As-of block (optional)", min_value=0, value=0, step=1)
-    as_of_block = int(as_of) if as_of > 0 else None
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Window for Deltas")
-    delta_start = int(st.sidebar.number_input("Start block (exclusive)", min_value=0, value=0, step=1))
-    delta_end   = int(st.sidebar.number_input("End block (inclusive)",   min_value=0, value=0, step=1))
-
-    st.sidebar.markdown("---")
-    top_n = int(st.sidebar.slider("Top N (tables)", min_value=5, max_value=100, value=10, step=1))
-    whale_threshold = int(st.sidebar.number_input("Whale threshold (units)", min_value=0, value=1000, step=1))
-
-    return AppState(
-        db_path=db_path,
-        contract=contract,
-        as_of_block=as_of_block,
-        top_n=top_n,
-        whale_threshold=whale_threshold,
-        delta_start=delta_start,
-        delta_end=delta_end,
+    contract_input = st.text_input("ERC 20 contract", value="")
+    # optional list from DB
+    pick_from_db = st.selectbox(
+        "Pick a contract found in DB",
+        options=([""] + contracts["contract"].tolist()),
+        index=0,
+        format_func=lambda x: x if x else "—"
     )
+    contract = (contract_input or pick_from_db or "").strip()
+    if not contract:
+        st.info("Select or paste an ERC-20 contract to continue.")
+        st.stop()
 
-def main():
-    state = sidebar()
+    as_of_block = st.number_input("As of block optional", min_value=0, value=pick_as_of_block(connect(cfg), contract, default_zero=True), step=1)
 
-    st.title("Onchain Network Insights — Dashboard")
-    st.caption("Local analytics over your ingested ERC-20 data")
+    st.divider()
+    st.subheader("Window for Deltas")
+    start_block_excl = st.number_input("Start block exclusive", min_value=0, value=0, step=1)
+    end_block_incl   = st.number_input("End block inclusive",   min_value=0, value=0, step=1)
 
-    if not state.contract:
-        st.info("Enter a full ERC-20 contract (0x + 40 hex chars) or pick one from the DB.")
-        return
+    st.divider()
+    topn = st.slider("Top N tables", min_value=5, max_value=100, value=10)
+    whale_threshold = st.number_input("Whale threshold units", min_value=0.0, value=1000.0, step=1.0)
 
-    dbp = Path(state.db_path)
-    if not dbp.exists():
-        st.error(f"DB not found: {dbp}")
-        return
 
-    try:
-        with closing(sqlite3.connect(state.db_path)) as con:
-            con.row_factory = None
+# ----------------------------
+# Metrics / sections
+# ----------------------------
 
-            # Compute metrics
-            top_df, meta = holder_balances(
-                con,
-                contract=state.contract,
-                as_of=state.as_of_block,
-                top_n=state.top_n,
-            )
+with closing(connect(cfg)) as con:
+    symbol, decimals = read_metadata(con, contract)
+    holders = holders_count(con, contract, as_of_block)
+    total = total_supply(con, contract, as_of_block, decimals)
+    gini = gini_coefficient(con, contract, as_of_block)
+    xfers = transfers_count(con, contract)
+    cr_df = concentration_ratios(con, contract, as_of_block, ks=(1,2,3,5,10))
 
-            cr_df = concentration_ratios(
-                con,
-                contract=state.contract,
-                as_of=state.as_of_block,
-            )
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1.metric("Symbol", symbol)
+col2.metric("Decimals", decimals)
+col3.metric("First block", "N A")  # optional: compute min block if you want
+col4.metric("Last block", "N A")
+col5.metric("Transfers", xfers)
+col6.metric("CR10", f"{cr_df.loc[cr_df['k'] == 10, 'ratio_pct'].values[0]:.2f}%" if (10 in cr_df["k"].values) else "0.00%")
 
-            whales_df = whales(
-                con,
-                contract=state.contract,
-                threshold=state.whale_threshold,
-                as_of=state.as_of_block,
-                top_n=state.top_n,
-            )
+st.metric("Holders", holders)
+st.metric(f"Total supply as of [{symbol}]", f"{total:,.4f}")
+st.metric("Gini", f"{gini:.4f}")
 
-            symbol = f"[{meta.get('symbol')}] " if meta.get("symbol") else ""
+# Top holders
+with closing(connect(cfg)) as con:
+    top_df = top_holders(con, contract, as_of_block, topn)
+st.subheader("Top Holders")
+if top_df.empty:
+    st.info("No holders at the selected as-of block.")
+else:
+    st.bar_chart(top_df.set_index("address_short")["balance_units"])
+    st.dataframe(top_df[["address","balance_units"]], use_container_width=True)
 
-            # KPIs
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Holders", value=f"{len(top_df)}")
-            with col2:
-                total_supply = con.execute("""
-                    SELECT COALESCE(SUM(balance),0)
-                    FROM balances_view
-                    WHERE contract = ?
-                      AND (? IS NULL OR last_block <= ?)
-                """, (state.contract, state.as_of_block, state.as_of_block)).fetchone()[0] or 0
-                st.metric(f"Total supply (as-of) {symbol}".strip(), value=f"{total_supply:,}")
-            with col3:
-                # quick/rough gini based on current sample of top balances
-                vals = top_df["balance"].astype(float).clip(lower=0).sort_values().values
-                if len(vals) == 0:
-                    g = 0.0
-                else:
-                    # simple Gini on sample
-                    n = len(vals)
-                    cum = (2 * (vals * (pd.Series(range(1, n+1))).values).sum()) / (n * vals.sum()) - (n + 1) / n
-                    g = max(0.0, round(cum, 4))
-                st.metric("Gini", value=f"{g:.4f}")
-            with col4:
-                cr10 = cr_df.loc[cr_df["k"] == 10, "ratio"].values
-                cr10_val = f"{(cr10[0]*100):.2f}%" if len(cr10) else "0.00%"
-                st.metric("CR10", value=cr10_val)
+# Whales
+with closing(connect(cfg)) as con:
+    whales_df = whales(con, contract, as_of_block, whale_threshold, topn)
+st.subheader(f"Whales ≥ {int(whale_threshold)}")
+if whales_df.empty:
+    st.info("No whales at the selected threshold and as-of block.")
+else:
+    st.bar_chart(whales_df.set_index("address_short")["balance_units"])
+    c1, c2 = st.columns(2)
+    c1.dataframe(whales_df[["address","balance_units"]], use_container_width=True)
+    c2.dataframe(whales_df[["address","balance_units"]], use_container_width=True)
 
-            # Top holders + Whales charts
-            st.subheader("Top Holders")
-            st.bar_chart(top_df.set_index("address")["balance"])
+# Concentration ratios
+st.subheader("Concentration Ratios")
+st.line_chart(cr_df.set_index("k")["ratio"])
+st.dataframe(cr_df.assign(ratio_pct=cr_df["ratio_pct"].round(2)), use_container_width=True)
 
-            st.subheader(f"Whales (≥ {state.whale_threshold} {meta.get('symbol','').upper()})")
-            st.bar_chart(whales_df.set_index("address")["balance"])
+# Deltas
+with closing(connect(cfg)) as con:
+    deltas_df = holder_deltas(con, contract, start_block_excl, end_block_incl)
 
-            # Tables
-            colA, colB = st.columns(2)
-            with colA:
-                st.dataframe(top_df, use_container_width=True)
-            with colB:
-                st.dataframe(whales_df, use_container_width=True)
+st.subheader("Holder Deltas")
+if start_block_excl <= 0 and end_block_incl <= 0:
+    st.info("Set a valid window to see deltas.")
+elif deltas_df.empty:
+    st.info("No holder deltas in the selected window.")
+else:
+    st.dataframe(deltas_df, use_container_width=True)
 
-            st.subheader("Concentration Ratios")
-            st.line_chart(cr_df.set_index("k")["ratio"])
-            st.dataframe(cr_df, use_container_width=True)
-
-            # Windowed deltas (optional)
-            if state.delta_start < state.delta_end:
-                st.subheader("Holder Deltas (Growth / Spend)")
-                # Compute basic deltas on the fly from transfers
-                sql = f"""
-                    WITH span AS (
-                      SELECT *
-                      FROM transfers_enriched
-                      WHERE contract = ?
-                        AND blockNumber >  ?  -- exclusive
-                        AND blockNumber <= ?  -- inclusive
-                    ),
-                    transfer_to AS (
-                      SELECT to_addr   AS address, SUM(value)    AS delta_in
-                      FROM span WHERE direction='transfer'
-                      GROUP BY 1
-                    ),
-                    transfer_from AS (
-                      SELECT from_addr AS address, SUM(value)    AS delta_out
-                      FROM span WHERE direction='transfer'
-                      GROUP BY 1
-                    ),
-                    mint AS (
-                      SELECT to_addr   AS address, SUM(base_delta) AS mint_in
-                      FROM span WHERE direction='mint'
-                      GROUP BY 1
-                    ),
-                    burn AS (
-                      SELECT from_addr AS address, SUM(base_delta) AS burn_out
-                      FROM span WHERE direction='burn'
-                      GROUP BY 1
-                    )
-                    SELECT
-                      COALESCE(ti.address, to2.address, mi.address, bo.address) AS address,
-                      COALESCE(ti.delta_in, 0)  AS transfer_in,
-                      COALESCE(to2.delta_out, 0) AS transfer_out,
-                      COALESCE(mi.mint_in, 0)   AS mint_in,
-                      COALESCE(bo.burn_out, 0)  AS burn_out
-                    FROM transfer_to ti
-                    FULL OUTER JOIN transfer_from to2 ON to2.address = ti.address
-                    FULL OUTER JOIN mint mi           ON mi.address  = COALESCE(ti.address, to2.address)
-                    FULL OUTER JOIN burn bo           ON bo.address  = COALESCE(ti.address, to2.address, mi.address)
-                """
-                # SQLite lacks FULL OUTER JOIN; emulate via UNION of LEFT JOINs
-                sql = f"""
-                    WITH span AS (
-                      SELECT *
-                      FROM transfers_enriched
-                      WHERE contract = ?
-                        AND blockNumber >  ?
-                        AND blockNumber <= ?
-                    ),
-                    transfer_in AS (
-                      SELECT to_addr AS address, SUM(value) AS transfer_in
-                      FROM span WHERE direction='transfer'
-                      GROUP BY 1
-                    ),
-                    transfer_out AS (
-                      SELECT from_addr AS address, SUM(value) AS transfer_out
-                      FROM span WHERE direction='transfer'
-                      GROUP BY 1
-                    ),
-                    mint AS (
-                      SELECT to_addr AS address, SUM(base_delta) AS mint_in
-                      FROM span WHERE direction='mint'
-                      GROUP BY 1
-                    ),
-                    burn AS (
-                      SELECT from_addr AS address, SUM(base_delta) AS burn_out
-                      FROM span WHERE direction='burn'
-                      GROUP BY 1
-                    ),
-                    combined AS (
-                      SELECT address FROM transfer_in
-                      UNION
-                      SELECT address FROM transfer_out
-                      UNION
-                      SELECT address FROM mint
-                      UNION
-                      SELECT address FROM burn
-                    )
-                    SELECT
-                      c.address,
-                      COALESCE(ti.transfer_in, 0)  AS transfer_in,
-                      COALESCE(to2.transfer_out, 0) AS transfer_out,
-                      COALESCE(mi.mint_in, 0)     AS mint_in,
-                      COALESCE(bo.burn_out, 0)    AS burn_out
-                    FROM combined c
-                    LEFT JOIN transfer_in  ti  ON ti.address  = c.address
-                    LEFT JOIN transfer_out to2 ON to2.address = c.address
-                    LEFT JOIN mint         mi  ON mi.address  = c.address
-                    LEFT JOIN burn         bo  ON bo.address  = c.address
-                    ORDER BY (COALESCE(ti.transfer_in,0)+COALESCE(mi.mint_in,0)) DESC
-                    LIMIT ?
-                """
-                rows = con.execute(
-                    sql,
-                    (state.contract, state.delta_start, state.delta_end, state.top_n),
-                ).fetchall()
-                deltas_df = pd.DataFrame(
-                    rows,
-                    columns=["address", "transfer_in", "transfer_out", "mint_in", "burn_out"],
-                )
-                st.dataframe(deltas_df, use_container_width=True)
-            else:
-                st.info("Set a valid window (start < end) to see deltas/gainers/spenders.")
-
-    except RuntimeError as e:
-        st.error(str(e))
-    except sqlite3.OperationalError as e:
-        st.error(f"SQLite error while reading analytics: {e}")
-
-if __name__ == "__main__":
-    main()
+# Snapshot zip
+st.divider()
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+    now = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    prefix = f"oni_snapshot_{symbol or 'token'}_{now}"
+    for name, df in [
+        ("top_holders.csv", top_df),
+        ("whales.csv", whales_df),
+        ("concentration_ratios.csv", cr_df),
+        ("holder_deltas.csv", deltas_df),
+    ]:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            z.writestr(f"{prefix}/{name}", df.to_csv(index=False))
+st.download_button("Download snapshot zip", data=buf.getvalue(), file_name="snapshot.zip", mime="application/zip")
