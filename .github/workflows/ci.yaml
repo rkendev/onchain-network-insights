@@ -12,12 +12,18 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Minimum % coverage required to pass. You can tweak per repo or per job via matrix.
+  # Minimum % coverage required to pass. Tweak as needed.
   COV_MIN: "80"
 
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Surface secrets through env so we can safely test in an if: expression
+    env:
+      GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+      GIST_ID: ${{ secrets.GIST_ID }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +42,6 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # If you have a dev/requirements-dev.txt, prefer that. Otherwise install here.
           pip install -r requirements.txt
           pip install pytest pytest-cov coverage-badge
 
@@ -57,7 +62,6 @@ jobs:
           cov_min = float(os.environ.get("COV_MIN", "80"))
           rate = float(ET.parse("coverage.xml").getroot().attrib["line-rate"]) * 100
           print(f"Coverage: {rate:.2f}% (minimum required: {cov_min:.2f}%)")
-          # Write short summary for job logs
           with open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a") as f:
               f.write(f"### Coverage\n\n- **Total:** {rate:.2f}%\n- **Minimum required:** {cov_min:.2f}%\n")
           if rate + 1e-9 < cov_min:
@@ -78,21 +82,7 @@ jobs:
             coverage.svg
             htmlcov/
 
-      # OPTIONAL: publish a live badge via a Gist for README usage.
-      # Create a secret named GIST_TOKEN with "gist" scope and a secret named GIST_ID
-      # that points to an existing Gist file (e.g., coverage.json) to host the badge data.
-      - name: Publish badge to Gist (optional)
-        if: ${{ secrets.GIST_TOKEN != '' && secrets.GIST_ID != '' }}
-        uses: schneegans/dynamic-badges-action@v1.7.0
-        with:
-          auth: ${{ secrets.GIST_TOKEN }}
-          gistID: ${{ secrets.GIST_ID }}
-          filename: coverage.json
-          label: coverage
-          message: ${{ steps.readcov.outputs.percent || 'n/a' }}
-          color: green
-
-      # Helper step to expose percent for the optional badge step above
+      # Read the percent BEFORE the optional publish step
       - id: readcov
         name: Read percent (for optional badge)
         run: |
@@ -102,3 +92,16 @@ jobs:
           print(f"{rate:.2f}")
           PY
           echo "percent=$(cat percent.txt)" >> "$GITHUB_OUTPUT"
+
+      # OPTIONAL publish to a Gist for a live badge in README.
+      # Requires a Gist with a file (e.g., coverage.json) and a PAT with "gist" scope.
+      - name: Publish badge to Gist (optional)
+        if: ${{ env.GIST_TOKEN != '' && env.GIST_ID != '' && github.event_name != 'pull_request' }}
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        with:
+          auth: ${{ env.GIST_TOKEN }}
+          gistID: ${{ env.GIST_ID }}
+          filename: coverage.json
+          label: coverage
+          message: ${{ steps.readcov.outputs.percent }}
+          color: green
