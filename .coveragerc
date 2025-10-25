@@ -1,0 +1,18 @@
+[run]
+branch = True
+source =
+    ingestion
+    etl
+    storage
+    dashboard
+omit =
+    */tests/*
+    venv/*
+    .venv/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if typing.TYPE_CHECKING:
+    if __name__ == .__main__.:
+show_missing = True
